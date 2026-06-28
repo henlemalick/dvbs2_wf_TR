@@ -32,11 +32,6 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$HERE/bin/dvbs2_wf_TR"
 CONFIG_DIR="$HERE/config"
 
-# ---- environment (must match run-time engine location) ---------------------
-export LD_LIBRARY_PATH="/usr/local/lib/.engine/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export QT_QPA_PLATFORM=offscreen
-export DVBS2_ENV=/usr/local/lib/.engine
-
 # ---- parse operation and optional profile ----------------------------------
 _OP="$1"
 _PROFILE="${2:-video}"

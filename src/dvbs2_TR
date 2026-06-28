@@ -18,6 +18,12 @@
 # =============================================================================
 import argparse, json, os, platform, re, shutil, signal, subprocess, sys, threading, time
 
+# Runtime environment for subprocesses (C extensions, Qt, engine path)
+os.environ.setdefault("LD_LIBRARY_PATH",
+    "/usr/local/lib/.engine/lib" + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("DVBS2_ENV", "/usr/local/lib/.engine")
+
 # When frozen by PyInstaller, __file__ points at sys._MEIPASS (the temp
 # extraction tree — where bundled helpers live). The OPERATOR'S bundle dir is
 # the directory of the executable itself; that's where link.toml + media/ +
