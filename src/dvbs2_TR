@@ -359,18 +359,39 @@ signal.signal(signal.SIGTERM, _sigint)
 signal.signal(signal.SIGINT,  _sigint)
                                                         # is raised inside a C-extension)
 
+def _resolve_serial(cfg, direction):
+    """Extract B210 serial from config device_args, or probe UHD for one."""
+    da = usrp_args(cfg, direction)
+    m = re.search(r"serial=([0-9A-Za-z]+)", da)
+    if m: return m.group(1)
+    try:
+        probe = subprocess.run(
+            [pybin(), "-c", "import uhd,sys; ds=uhd.find('type=b200'); "
+             "print(ds[0]['serial']) if ds else sys.exit(2)"],
+            env=gr_env(), capture_output=True, text=True, timeout=8)
+        if probe.returncode == 0 and probe.stdout.strip():
+            return probe.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
 def tx_args(cfg):
     s = cfg["tx"]; mc = modcod_for_app(s["modcod"]); fr = s.get("frame_size","normal")
     sr = float(s["symbol_rate"]); sps = int(s.get("oversample",2))
     net = net_ts_bps(s["modcod"], fr, sr, bool(s.get("pilots",True)))
-    a = [app("dvbs2-tx"),"-m",mc,"-s",str(int(sr)),"--sps",str(sps),
-         "-r",str(s.get("rolloff",0.35)),"--frame-size",fr,
-         "--sink","usrp","--usrp-args",usrp_args(cfg,"tx"),
-         "--usrp-antenna",s.get("antenna","TX/RX"),
-         "--usrp-gain",str(s.get("gain_db",89)),"-f",str(int(float(s["freq_hz"]))),
-         "--usrp-otw-format", samp_type_of(cfg),
-         "--usrp-stream-args", low_lat_stream_args()]
-    if s.get("pilots",True): a += ["--pilots"]
+    serial = _resolve_serial(cfg, "tx")
+    a = [pybin(), find_helper("gr_txonly.py"),
+         "--modcod", mc, "--sym-rate", str(int(sr)), "--sps", str(sps),
+         "--rolloff", str(s.get("rolloff",0.35)), "--frame-size", fr,
+         "--tx-gain", str(s.get("gain_db",70)),
+         "--tx-antenna", s.get("antenna","TX/RX"),
+         "--tx-freq", str(int(float(s["freq_hz"]))),
+         "--otw-format", samp_type_of(cfg),
+         "--stream-args", low_lat_stream_args(),
+         "--in-fd", "0"]
+    if serial: a += ["--serial", serial]
+    if s.get("pilots",True): a += ["--pilots", "on"]
+    else: a += ["--pilots", "off"]
     return a, mc, fr, sr, net
 
 def spawn_tx_raw(cfg, raw_udp_in=0):
@@ -385,7 +406,7 @@ def spawn_tx_raw(cfg, raw_udp_in=0):
     _gen_err = sys.stderr if raw_udp_in else subprocess.DEVNULL
     gen = _popen(gen_args,
           stdout=subprocess.PIPE, stderr=_gen_err, env=env)
-    tx = _popen([pybin()]+txargs+["--source","fd","--in-fd","0"],
+    tx = _popen(txargs,
           stdin=gen.stdout, stderr=open(rp("dvbs2_tx.radio.log"),"w"), env=env)
     return [gen, tx]
 
@@ -835,18 +856,17 @@ def cmd_tx(cfg, raw, encoder=None, raw_udp_in=0):
     if res == "auto": res = auto_resolution(vb)
     fps = int(pl.get("framerate",25))
     if src.startswith("file:"):
-        # FILE source -> pre-encode once to a cached CBR mpegts, then stream the file
-        # (avoids live x264 fighting the realtime demod for CPU on encode-less hosts).
         cache = preencode_file(src[5:], res, vb, net, fps)
         print(f"TX video (file): {cache} -> {mc} {fr} @ {sr/1e6:.3f} MSym/s")
-        tx = _popen([pybin()]+txargs+["--source","file","--in-file",cache,"--in-repeat"],
-              stderr=open(rp("dvbs2_tx.radio.log"),"w"), env=gr_env())
+        cat = _popen(["cat", cache], stdout=subprocess.PIPE)
+        tx = _popen(txargs,
+              stdin=cat.stdout, stderr=open(rp("dvbs2_tx.radio.log"),"w"), env=gr_env())
         tx_stats_loop(tx, cfg, "video (file)"); return
     enc = (encoder or pl.get("encoder", "hw")).lower()
     print(f"TX video (live, encoder={enc}): {src} -> {res}@{vb/1e6:.2f}Mbps -> {mc} {fr} @ {sr/1e6:.3f} MSym/s")
     ff = _popen(build_encode(src,res,vb,net,fps,enc),
           stdout=subprocess.PIPE, stderr=open(rp("dvbs2_tx.enc.log"),"w"), env=media_env())
-    tx = _popen([pybin()]+txargs+["--source","fd","--in-fd","0"],
+    tx = _popen(txargs,
           stdin=ff.stdout, stderr=open(rp("dvbs2_tx.radio.log"),"w"), env=gr_env())
     tx_stats_loop(tx, cfg, "video (live)")
 
@@ -995,18 +1015,24 @@ def cmd_rx(cfg, raw, full_stats=False, raw_udp_out=""):
     mc_app = "QPSK1/2" if auto else modcod_for_app(s["modcod"])   # placeholder for ACM init
     mc = "auto(ACM)" if auto else mc_app              # display label
     pilots = "auto" if auto else ("on" if s.get("pilots",True) else "off")
-    rxargs = [app("dvbs2-rx"),"-m",mc_app,"-p",pilots,
-              "-s",str(int(sr)),"--sps",str(sps),"--frame-size",fr,
-              "--source","usrp","--usrp-args",usrp_args(cfg,"rx"),
-              "--usrp-antenna",s.get("antenna","RX2"),
-              "--usrp-gain",str(s.get("gain_db",40)),"--usrp-lo-offset",str(int(loff)),
-              "-f",str(int(float(s["freq_hz"]))),
-              "--usrp-otw-format", samp_type_of(cfg),
-              "--usrp-stream-args", low_lat_stream_args()]
+    serial = _resolve_serial(cfg, "rx")
+    rxargs = [pybin(), find_helper("gr_rxonly.py"),
+              "--modcod", mc_app, "--sym-rate", str(int(sr)), "--sps", str(sps),
+              "--frame-size", fr, "--rolloff", str(s.get("rolloff",0.35)),
+              "--rx-gain", str(s.get("gain_db",40)),
+              "--rx-antenna", s.get("antenna","RX2"),
+              "--rx-freq", str(int(float(s["freq_hz"]))),
+              "--lo-offset", str(int(loff)),
+              "--otw-format", samp_type_of(cfg),
+              "--stream-args", low_lat_stream_args(),
+              "--out-fd", "1",
+              "--ldpc-iterations", str(cfg.get("fec",{}).get("ldpc_iters",25))]
+    if serial: rxargs += ["--serial", serial]
+    if pilots != "off": rxargs += ["--pilots", pilots]
     if auto: rxargs += ["--pl-acm-vcm"]               # accept all MODCODs; detect from PL header
     if full_stats: rxargs += ["--mon-server","--mon-port",str(MONPORT)]
     env = media_env()
-    rxcmd = gr_shell_prefix() + "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
+    rxcmd = "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
     UHD = f"2>{rp('dvbs2_rx.radio.log')}"
     if raw:
         print(f"RX raw-data readout: {mc} {fr} @ {sr/1e6:.3f} MSym/s"
@@ -1016,7 +1042,7 @@ def cmd_rx(cfg, raw, full_stats=False, raw_udp_out=""):
         pt_arg = f" --payload-text {shlex.quote(pt)}" if pt else ""
         udp_out_arg = f" --udp-out {shlex.quote(raw_udp_out)}" if raw_udp_out else ""
         rx_verbose_arg = " --verbose" if full_stats else ""
-        sh = (rxcmd + f" --sink fd --out-fd 3 3>&1 1>/dev/null {UHD} | "
+        sh = (rxcmd + f" {UHD} | "
               f"'{pybin()}' '{find_helper('rawdata_rx.py')}' --stdin "
               f"--pid 0x100 --plen 200 --rate 600000 --modcod '{mc}' --symrate {int(sr)} "
               f"--freq {int(float(s['freq_hz']))} --mode 'DVBS2_TR link'{pt_arg}{udp_out_arg}{rx_verbose_arg}")
@@ -1027,29 +1053,27 @@ def cmd_rx(cfg, raw, full_stats=False, raw_udp_out=""):
     def consumer():                          # consumes the TS on stdin into the sink
         if sink == "display":         return f"| '{pybin()}' '{find_helper('ts_smooth.py')}' --bitrate {int(net_bps)} | '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
         if sink.startswith("udp://"):
-            u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"   # 7x188; player-friendly UDP TS
+            u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"
             return f"| '{FFMPEG}' -hide_banner -loglevel error -fflags +nobuffer -probesize 32 -analyzeduration 0 -f mpegts -i - -c copy -flush_packets 1 -f mpegts '{u}' 2>/tmp/dvbs2_sink.log"
         return f"> '{sink[5:] if sink.startswith('file:') else '/tmp/dvbs2_rx.ts'}'"
     if full_stats:
-        # TS straight to the sink; the rich per-second line comes from the monitor poll.
         if sink.startswith("file:"):
-            tail = f"--sink fd --out-fd 3 3>'{sink[5:]}' 1>/dev/null {UHD}"
+            tail = f"{UHD} > '{sink[5:]}'"
         else:
-            tail = f"--sink fd --out-fd 3 3>&1 1>/dev/null {UHD} " + consumer()
+            tail = f"{UHD} " + consumer()
         print(f"RX video -> {sink} (FULL STATS): {mc} {fr} @ {sr/1e6:.3f} MSym/s")
         spawn = lambda: _popen(["bash","-c", rxcmd + " " + tail], env=env)
-        if auto:                              # ACM: relaunch on a live-MODCOD-change fault
+        if auto:
             _supervise_rx(mc, spawn, lambda p: poll_full_stats(MONPORT, cfg, p))
         else:
             poll_full_stats(MONPORT, cfg, spawn())
         return
-    # default: TS through ts_tee_stats (recovered bitrate/continuity/lock + elapsed)
     tee = (f"| '{pybin()}' '{find_helper('ts_tee_stats.py')}' --pid auto "
            f"--modcod '{mc}' --frame '{fr}' --symrate {int(sr)}")
-    sh = rxcmd + f" --sink fd --out-fd 3 3>&1 1>/dev/null {UHD} " + tee + " " + consumer()
+    sh = rxcmd + f" {UHD} " + tee + " " + consumer()
     print(f"RX video -> {sink}: {mc} {fr} @ {sr/1e6:.3f} MSym/s  (live stats below)")
     spawn = lambda: _popen(["bash","-c",sh], env=env)
-    if auto: _supervise_rx(mc, spawn)         # ACM: relaunch on a live-MODCOD-change fault
+    if auto: _supervise_rx(mc, spawn)
     else: _wait([spawn()])
 
 def cmd_bench(cfg, secs, raw_udp_in=0, raw_udp_out=""):
@@ -1062,20 +1086,28 @@ def cmd_bench(cfg, secs, raw_udp_in=0, raw_udp_out=""):
     s = cfg["rx"]; mc = modcod_for_app(s["modcod"]); fr = s.get("frame_size","normal")
     sr = float(s["symbol_rate"]); sps = int(s.get("oversample",4))
     loff = float(s.get("lo_offset_hz", 2e6))
-    rxargs = [app("dvbs2-rx"),"-m",mc,"-p","on" if s.get("pilots",True) else "off",
-              "-s",str(int(sr)),"--sps",str(sps),"--frame-size",fr,
-              "--source","usrp","--usrp-args",usrp_args(cfg,"rx"),
-              "--usrp-antenna",s.get("antenna","RX2"),"--usrp-gain",str(s.get("gain_db",40)),
-              "--usrp-lo-offset",str(int(loff)),"-f",str(int(float(s["freq_hz"]))),
-              "--usrp-otw-format", samp_type_of(cfg),
-              "--usrp-stream-args", low_lat_stream_args()]
-    rxcmd = gr_shell_prefix() + "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
+    serial = _resolve_serial(cfg, "rx")
+    rxargs = [pybin(), find_helper("gr_rxonly.py"),
+              "--modcod", mc, "--sym-rate", str(int(sr)), "--sps", str(sps),
+              "--frame-size", fr, "--rolloff", str(s.get("rolloff",0.35)),
+              "--rx-gain", str(s.get("gain_db",40)),
+              "--rx-antenna", s.get("antenna","RX2"),
+              "--rx-freq", str(int(float(s["freq_hz"]))),
+              "--lo-offset", str(int(loff)),
+              "--otw-format", samp_type_of(cfg),
+              "--stream-args", low_lat_stream_args(),
+              "--out-fd", "1",
+              "--ldpc-iterations", str(cfg.get("fec",{}).get("ldpc_iters",25))]
+    if serial: rxargs += ["--serial", serial]
+    if s.get("pilots",True): rxargs += ["--pilots", "on"]
+    else: rxargs += ["--pilots", "off"]
+    rxcmd = "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
     import shlex
     pt = raw_payload_text(cfg)
     pt_arg = f" --payload-text {shlex.quote(pt)}" if pt else ""
     udp_out_arg = f" --udp-out {shlex.quote(raw_udp_out)}" if raw_udp_out else ""
     sh = (f"timeout {int(secs)} bash -c \"" + rxcmd +
-          f" --sink fd --out-fd 3 3>&1 1>/dev/null 2>{rp('dvbs2_rx.radio.log')} | "
+          f" 2>{rp('dvbs2_rx.radio.log')} | "
           f"'{pybin()}' '{find_helper('rawdata_rx.py')}' --stdin --pid 0x100 --plen 200 "
           f"--rate 600000 --modcod '{mc}' --symrate {int(sr)} --freq {int(float(s['freq_hz']))} "
           f"--mode 'DVBS2_TR self-test'{pt_arg}{udp_out_arg}\"")

@@ -7,6 +7,8 @@ cd "$SRC"
 /usr/local/lib/.engine/bin/python3 -m PyInstaller --onefile \
     --name dvbs2_wf_TR \
     --add-data gr_fullduplex.py:. \
+    --add-data gr_txonly.py:. \
+    --add-data gr_rxonly.py:. \
     --add-data ts_tee_stats.py:. \
     --add-data ts_smooth.py:. \
     --add-data rawdata_gen.py:. \
