@@ -1,0 +1,42 @@
+# dvbs2_wf_TR - raw data mode without UDP
+# Synthetic data self-test (TX generates test frames, RX verifies)
+# Usage: dvbs2_wf_TR.sh bench raw_wo_udp
+#        dvbs2_wf_TR.sh tx raw_wo_udp --raw
+#        dvbs2_wf_TR.sh rx raw_wo_udp --raw
+
+[node]
+device_args = "type=b200"
+
+[tx]
+device_args = "type=b200,serial=8000693"
+freq_hz     = 1.282e9
+modcod      = "QPSK_1/2"
+frame_size  = "short"
+pilots      = true
+rolloff     = 0.35
+symbol_rate = 2.0e6
+oversample  = 2
+gain_db     = 70
+antenna     = "TX/RX"
+
+[rx]
+device_args  = "type=b200,serial=8000693"
+freq_hz      = 1.282e9
+modcod       = "QPSK_1/2"
+frame_size   = "short"
+pilots       = true
+symbol_rate  = 2.0e6
+oversample   = 4
+gain_db      = 40
+antenna      = "RX2"
+lo_offset_hz = 4.0e6
+
+[fec]
+ldpc_iters  = 25
+
+[raw]
+payload = "TAG 786 latency test"
+
+[runtime]
+log_level = "info"
+stats_period_ms = 1000

@@ -1,0 +1,1335 @@
+#!/usr/bin/env python3
+# =============================================================================
+# DVBS2_TR - one executable + one config (link.toml) for a low-latency DVB-S2
+# video/data link over a USRP B210 software-defined radio.
+#
+# "One config, one binary" operator surface. All backend/library diagnostics are
+# silenced so nothing but DVBS2_TR's own output reaches the terminal; low-level
+# radio device messages are routed to a log file under the run directory.
+#
+#   DVBS2_TR --config link.toml check     preflight: runtime, radio, config, rates
+#   DVBS2_TR --config link.toml tx        transmit  (video per [payload], or raw with --raw)
+#   DVBS2_TR --config link.toml rx        receive   (video per [payload], or raw with --raw)
+#   DVBS2_TR --config link.toml bench     raw-data link self-test (TX feeds, RX reads, latency)
+#   DVBS2_TR --config link.toml duplex    transmit + receive at once on one radio
+#   DVBS2_TR --config link.toml rates     print the auto-scaled MODCOD net-rate/resolution
+#
+# Resolution auto-scales to the MODCOD net rate when [payload].resolution = "auto".
+# =============================================================================
+import argparse, json, os, platform, re, shutil, signal, subprocess, sys, threading, time
+
+# When frozen by PyInstaller, __file__ points at sys._MEIPASS (the temp
+# extraction tree — where bundled helpers live). The OPERATOR'S bundle dir is
+# the directory of the executable itself; that's where link.toml + media/ +
+# a per-bundle .engine/ (when present) live.
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+# Self-contained bundle runs from HERE/runtime — or HERE/.engine, HERE/engine,
+# HERE/.runtime when the operator wants the engine hidden / renamed; ALSO
+# accepts a system-installed engine at /usr/local/lib/dvbs2_TR_engine when the
+# operator station was provisioned via the .deb package; falls back to a
+# legacy path, or an explicit DVBS2_ENV override.
+_SYSTEM_ENGINE = "/usr/local/lib/.engine"
+def _pick_env():
+    if os.environ.get("DVBS2_ENV"): return os.environ["DVBS2_ENV"]
+    # PyInstaller / system-install:  /usr/local/lib/dvbs2_TR_engine wins
+    # when there is no per-bundle directory at HERE — that's the .deb
+    # path where the operator station ships only dvbs2_TR + link.toml + media.
+    for d in (".engine", "engine", ".runtime", "runtime"):
+        p = os.path.join(HERE, d)
+        if os.path.isdir(p): return p
+    if os.path.isdir(_SYSTEM_ENGINE): return _SYSTEM_ENGINE
+    return os.path.expanduser("~/wfhss_deploy/env")
+ENV = _pick_env()
+RUNDIR = os.environ.get("DVBS2_RUNDIR") or "/tmp"          # scratch dir: logs/cache/sink
+def rp(name): return os.path.join(RUNDIR, name)
+MONPORT = 8011                                   # receiver monitor HTTP port for --full-stats
+def _pick_images():
+    """Radio firmware images live under share/<X>/images. Original layout used
+    'uhd'; the post-rebrand layout renames it to 'radio'. Pick whichever
+    actually exists so the same driver works before AND after the rebrand."""
+    for sub in ("radio", "uhd"):
+        p = os.path.join(ENV, "share", sub, "images")
+        if os.path.isdir(p): return p
+    return os.path.join(ENV, "share", "uhd", "images")  # last-resort default
+IMAGES = _pick_images()                                   # bundled radio images (offline)
+# media tool: prefer a system ffmpeg/ffplay; else fall back to the one inside the
+# runtime, run via media_env (no runtime LD_LIBRARY_PATH) so it resolves its own
+# libs by RPATH and is not crippled. Keeps the bundle self-contained, no system pkg.
+FFMPEG = shutil.which("ffmpeg") or os.path.join(ENV, "bin", "ffmpeg")
+FFPLAY = shutil.which("ffplay") or os.path.join(ENV, "bin", "ffplay")
+
+_SYSTEM_HELPERS = "/usr/local/lib/dvbs2_TR"
+
+def find_helper(name):
+    """Locate a helper script. Search order:
+       0) PyInstaller's runtime extraction dir (sys._MEIPASS), when the driver
+          is running as a frozen single-file binary,
+       1) the operator-hidden internal/ dir alongside the driver (minimal layout),
+       2) flat alongside the driver (legacy layout),
+       3) /usr/local/lib/dvbs2_TR/ (system .deb install — script-mode driver),
+       4) the repo's ../scripts (dev mode)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        p = os.path.join(meipass, name)
+        if os.path.exists(p): return os.path.abspath(p)
+    for p in (os.path.join(HERE, ".internal", name),
+              os.path.join(HERE, "internal", name),
+              os.path.join(HERE, name),
+              os.path.join(_SYSTEM_HELPERS, name),
+              os.path.join(HERE, "..", "scripts", name)):
+        if os.path.exists(p): return os.path.abspath(p)
+    return os.path.join(HERE, name)
+
+def default_config():
+    """Find link.toml without --config. Search order, first hit wins:
+      1. ./link.toml (CWD) - the deployed station case: operator cd's into
+         ~/DVBS2_TR_Deployed and types `dvbs2_TR check`.
+      2. <bundle_dir>/link.toml - the per-bundle case: dev tree where
+         dvbs2_TR + link.toml live next to each other.
+      3. <bundle_dir>/../config/link.toml - the repo case.
+      4. fallback: <bundle_dir>/link.toml so the error message still names
+         a sensible path."""
+    cwd = os.path.abspath(os.getcwd())
+    for p in (os.path.join(cwd, "link.toml"),
+              os.path.join(HERE, "link.toml"),
+              os.path.join(HERE, "..", "config", "link.toml")):
+        if os.path.exists(p): return os.path.abspath(p)
+    return os.path.join(HERE, "link.toml")
+
+# ---- DVB-S2 FEC parameters (BCH Kbch per code rate; ETSI EN 302 307-1) -------
+NLDPC = {"normal": 64800, "short": 16200}
+KBCH = {
+    "normal": {"1/4":16008,"1/3":21408,"2/5":25728,"1/2":32208,"3/5":38688,
+               "2/3":43040,"3/4":48408,"4/5":51648,"5/6":53840,"8/9":57472,"9/10":58192},
+    "short":  {"1/4":3072,"1/3":5232,"2/5":6312,"1/2":7032,"3/5":9552,
+               "2/3":10632,"3/4":11712,"4/5":12432,"5/6":13152,"8/9":14232},
+}
+MODBITS = {"QPSK":2, "8PSK":3, "16APSK":4, "32APSK":5}
+BBHEADER_BITS = 80
+
+def pl_symbols(modcod, frame, pilots):
+    """Total symbols per PLFRAME (payload + PLHEADER + pilots)."""
+    mod, _ = parse_modcod(modcod)
+    n_data = NLDPC[frame] // MODBITS[mod]            # payload symbols / PLFRAME
+    n_slots = n_data // 90
+    n_pilot_blocks = max(0, (n_slots - 1) // 16) if pilots else 0
+    return n_data + 90 + 36 * n_pilot_blocks         # +PLHEADER(90)
+
+def frame_rate(modcod, frame, symrate, pilots):
+    """PLFRAMEs transmitted per second (deterministic at a fixed symbol rate)."""
+    return symrate / pl_symbols(modcod, frame, pilots)
+
+def net_ts_bps(modcod, frame, symrate, pilots):
+    """Exact DVB-S2 useful TS bitrate for a MODCOD/frame/symrate (pilots-aware)."""
+    mod, rate = parse_modcod(modcod)
+    if frame not in KBCH or rate not in KBCH[frame]:
+        raise SystemExit(f"unsupported MODCOD/frame: {modcod} {frame}")
+    return (KBCH[frame][rate] - BBHEADER_BITS) * frame_rate(modcod, frame, symrate, pilots)
+
+def parse_modcod(s):
+    s = s.replace("_", "")                       # QPSK_3/5 -> QPSK3/5
+    m = re.match(r"(QPSK|8PSK|16APSK|32APSK)(\d+/\d+)$", s)
+    if not m: raise SystemExit(f"bad MODCOD '{s}'")
+    return m.group(1), m.group(2)
+
+def modcod_for_app(s):                           # link.toml 'QPSK_3/5' -> app '-m QPSK3/5'
+    mod, rate = parse_modcod(s); return mod + rate
+
+# ---- engine routing (internal) --------------------------------------------
+# QPSK/8PSK use the low-latency path (sub-second). 16/32APSK use the extended
+# path (higher latency); both run transparently behind the same CLI.
+SA_MOD = {"QPSK":1, "8PSK":2, "16APSK":3, "32APSK":4}          # extended-engine modulation idx
+SA_FEC = {"1/2":0,"2/3":1,"3/4":2,"5/6":3,"7/8":4,"4/5":5,     # extended-engine code-rate idx
+          "8/9":6,"9/10":7,"1/4":8,"1/3":9,"2/5":10,"3/5":11}
+# Reliably-smooth on the antenna link (docs/LINK_HARDENING.md). Others run but
+# depend on link margin (clean/cabled link).
+ROBUST = {("QPSK","1/2"),("QPSK","3/5"),("QPSK","2/3"),("8PSK","3/5"),("8PSK","2/3")}
+
+def is_auto(modcod): return str(modcod).lower() == "auto"   # RX ACM/VCM auto-detect
+
+def engine_for(modcod):
+    if is_auto(modcod): return "lowlat"         # ACM auto-detect, low-latency path (QPSK/8PSK)
+    mod, _ = parse_modcod(modcod)
+    return "extended" if mod in ("16APSK","32APSK") else "lowlat"
+
+def tier(modcod):
+    if is_auto(modcod): return "auto"
+    mod, rate = parse_modcod(modcod)
+    if mod in ("16APSK","32APSK"): return "APSK"
+    return "robust" if (mod, rate) in ROBUST else "margin"
+
+def latency_str(modcod, sr, frame):
+    if engine_for(modcod) == "extended": return "~1.5-2 s"
+    base = 1.54e6 / sr                          # ~0.77 s @ 2 MSym/s short (measured)
+    if frame == "normal": base *= 3.5
+    return f"~{base:.2f} s"
+
+def sa_indices(modcod):
+    mod, rate = parse_modcod(modcod)
+    return SA_MOD[mod], SA_FEC[rate]
+
+# ---- resolution ladder (auto-scale video to the net rate) --------------------
+def auto_resolution(video_bps):
+    mbps = video_bps / 1e6
+    for thr, res in [(0.5,"480x270"),(1.0,"640x360"),(1.8,"640x360"),
+                     (3.0,"854x480"),(5.0,"1280x720")]:
+        if mbps < thr: return res
+    return "1280x720"
+
+# ---- minimal TOML reader (flat key=val within [sections]; enough for link.toml)
+def load_toml(path):
+    cfg, sec = {}, None
+    for ln in open(path):
+        ln = ln.split("#", 1)[0].strip()
+        if not ln: continue
+        if ln.startswith("[") and ln.endswith("]"):
+            sec = ln[1:-1].strip(); cfg[sec] = {}; continue
+        if "=" in ln and sec is not None:
+            k, v = (x.strip() for x in ln.split("=", 1))
+            cfg[sec][k] = _coerce(v)
+    return cfg
+
+def _coerce(v):
+    if v.startswith('"') and v.endswith('"'): return v[1:-1]
+    if v in ("true","false"): return v == "true"
+    try:
+        f = float(v); return int(f) if f.is_integer() and "e" not in v.lower() and "." not in v else f
+    except ValueError:
+        return v
+
+# ---- run environments --------------------------------------------------------
+# The modem cores need the bundled runtime libs + the no-chatter knobs. ffmpeg/
+# ffplay are SYSTEM binaries and must NOT see the runtime LD_LIBRARY_PATH (it pulls
+# the runtime's libtinfo/ncurses/etc. and cripples them - a clean encode is ~3x faster).
+def gr_env():
+    e = dict(os.environ)
+    e["LD_LIBRARY_PATH"] = os.path.join(ENV, "lib") + ":" + e.get("LD_LIBRARY_PATH", "")
+    e["UHD_IMAGES_DIR"] = IMAGES               # load radio images from the bundle (offline)
+    e["QT_QPA_PLATFORM"] = "offscreen"
+    e["GR_CONF_LOG_LOG_LEVEL"] = "off"
+    e["GR_CONF_LOG_DEBUG_LEVEL"] = "off"
+    e["GR_CONF_LOG_LEVEL"] = "off"
+    return e
+
+def media_env():
+    return dict(os.environ)          # system libs for ffmpeg/ffplay
+
+def gr_shell_prefix():
+    # inline env so ONLY the modem core in a mixed bash pipe gets the runtime libs
+    return (f"LD_LIBRARY_PATH='{os.path.join(ENV,'lib')}' UHD_IMAGES_DIR='{IMAGES}' "
+            "QT_QPA_PLATFORM=offscreen "
+            "GR_CONF_LOG_LOG_LEVEL=off GR_CONF_LOG_DEBUG_LEVEL=off GR_CONF_LOG_LEVEL=off ")
+
+def app(name): return os.path.join(ENV, "bin", name)
+def pybin():   return os.path.join(ENV, "bin", "python3")
+
+# ---- stats writer: two-column or interleaved coloured prefixes ---------------
+# When the terminal is wide enough, the duplex --full-stats view renders TX on
+# the left, RX on the right, separated by "||". When narrower (or running
+# outside a tty, e.g. piped to a log), each side just prints on its own line
+# with a coloured prefix so the operator can still tell them apart at a glance.
+_TWOCOL_MIN_W = 160
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+def _ansi_len(s): return len(_ANSI_RE.sub("", s))
+
+class _StatsWriter:
+    """Coordinate TX and RX per-second lines. Thread-safe.
+
+    Each side calls writer.tx(sec, body) / writer.rx(sec, body) where `sec` is
+    elapsed-seconds-since-start (int) and `body` is the line body WITHOUT a
+    leading prefix (the writer adds a coloured [TX MM:SS] / [RX MM:SS] itself
+    so both sides share the same alignment).
+
+    In two-column mode the writer holds each side's line briefly until the
+    other side fills the same second (or 1.5 s elapse with one side missing).
+    """
+    def __init__(self):
+        self.t0 = time.time()
+        try: self.w = shutil.get_terminal_size((100, 24)).columns
+        except Exception: self.w = 100
+        self.two_col = self.w >= _TWOCOL_MIN_W and sys.stdout.isatty()
+        self.half = max(60, (self.w - 4) // 2) if self.two_col else self.w
+        self.buf = {}              # sec -> {'tx': str, 'rx': str}
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.flush_thread = None
+        if self.two_col:
+            t = threading.Thread(target=self._flusher, daemon=True)
+            t.start(); self.flush_thread = t
+
+    def _prefix(self, side, sec):
+        el = f"{sec//60:02d}:{sec%60:02d}"
+        # cyan TX, blue RX
+        col = "\033[1;36m" if side == "tx" else "\033[1;34m"
+        tag = "TX" if side == "tx" else "RX"
+        return f"{col}[{tag} {el}]\033[0m"
+
+    def _emit(self, sec, tx_body, rx_body):
+        tx = (self._prefix("tx", sec) + " " + tx_body) if tx_body else ""
+        rx = (self._prefix("rx", sec) + " " + rx_body) if rx_body else ""
+        if self.two_col:
+            tx_pad = max(0, self.half - _ansi_len(tx))
+            rx_pad = max(0, self.half - _ansi_len(rx))
+            print(f"{tx}{' ' * tx_pad} || {rx}{' ' * rx_pad}", flush=True)
+        else:
+            if tx: print(tx, flush=True)
+            if rx: print(rx, flush=True)
+
+    def _flusher(self):
+        # Periodically sweep for half-rows whose other side never arrived.
+        while not self.stop_event.is_set():
+            self.stop_event.wait(0.4)
+            if self.stop_event.is_set(): break
+            now_sec = int(time.time() - self.t0)
+            with self.lock:
+                for k in sorted(list(self.buf.keys())):
+                    if now_sec - k > 1:
+                        entry = self.buf.pop(k)
+                        self._emit(k, entry.get("tx"), entry.get("rx"))
+
+    def write(self, side, sec, body):
+        with self.lock:
+            entry = self.buf.setdefault(sec, {})
+            entry[side] = body
+            if "tx" in entry and "rx" in entry:
+                self._emit(sec, entry.get("tx"), entry.get("rx"))
+                del self.buf[sec]
+
+    def tx(self, sec, body): self.write("tx", sec, body)
+    def rx(self, sec, body): self.write("rx", sec, body)
+
+    def close(self):
+        self.stop_event.set()
+        with self.lock:
+            for k in sorted(self.buf.keys()):
+                entry = self.buf[k]
+                self._emit(k, entry.get("tx"), entry.get("rx"))
+            self.buf.clear()
+
+# ---- child-process management (clean shutdown stops the radios) --------------
+import atexit
+_PROCS = []
+def _popen(*a, **k):
+    k.setdefault("start_new_session", True)   # own process group -> clean group-kill
+    p = subprocess.Popen(*a, **k); _PROCS.append(p); return p
+def _reg(p): _PROCS.append(p); return p
+def _killgrp(p, sig):
+    try: os.killpg(os.getpgid(p.pid), sig)
+    except BaseException:
+        try: p.send_signal(sig)
+        except BaseException: pass
+def _kill_all():
+    for p in _PROCS:
+        if p.poll() is None: _killgrp(p, signal.SIGINT)
+    for p in _PROCS:
+        try: p.wait(timeout=3)
+        except BaseException: _killgrp(p, signal.SIGKILL)
+    # Belt-and-braces: any pipeline child that escaped its process group
+    # (bash `while :; do cat ...`, ts_tee_stats, gr_fullduplex, dvbs2-rx/-tx,
+    # ffmpeg) must NOT outlive the driver. Sweep by name. -P own-pid so we
+    # never kill ourselves.
+    own = os.getpid()
+    for name in ("ts_tee_stats.py","gr_fullduplex.py","rawdata_rx.py",
+                 "rawdata_gen.py","dvbs2-rx","dvbs2-tx"):
+        try:
+            subprocess.run(["pkill","-9","-f",name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=2)
+        except BaseException:
+            pass
+atexit.register(_kill_all)
+exiting = False
+def _sigint(*a):
+    global exiting
+    if not exiting:
+        exiting = True
+        sys.exit(0)
+
+atexit.register(_kill_all)
+signal.signal(signal.SIGTERM, _sigint)
+signal.signal(signal.SIGINT,  _sigint)
+                                                        # is raised inside a C-extension)
+
+def tx_args(cfg):
+    s = cfg["tx"]; mc = modcod_for_app(s["modcod"]); fr = s.get("frame_size","normal")
+    sr = float(s["symbol_rate"]); sps = int(s.get("oversample",2))
+    net = net_ts_bps(s["modcod"], fr, sr, bool(s.get("pilots",True)))
+    a = [app("dvbs2-tx"),"-m",mc,"-s",str(int(sr)),"--sps",str(sps),
+         "-r",str(s.get("rolloff",0.35)),"--frame-size",fr,
+         "--sink","usrp","--usrp-args",usrp_args(cfg,"tx"),
+         "--usrp-antenna",s.get("antenna","TX/RX"),
+         "--usrp-gain",str(s.get("gain_db",89)),"-f",str(int(float(s["freq_hz"]))),
+         "--usrp-otw-format", samp_type_of(cfg),
+         "--usrp-stream-args", low_lat_stream_args()]
+    if s.get("pilots",True): a += ["--pilots"]
+    return a, mc, fr, sr, net
+
+def spawn_tx_raw(cfg, raw_udp_in=0):
+    txargs, mc, fr, sr, net = tx_args(cfg); env = gr_env()
+    print(f"TX raw-data: {mc} {fr} @ {sr/1e6:.3f} MSym/s (net {net/1e6:.2f} Mbps)"
+          + (f"  | UDP-in :{raw_udp_in}" if raw_udp_in else ""))
+    gen_args = [pybin(), find_helper("rawdata_gen.py"),
+                "--plen","200","--datarate","600000","--netrate",str(int(sr)),"--pid","0x100"]
+    pt = raw_payload_text(cfg)
+    if pt: gen_args += ["--payload-text", pt]
+    if raw_udp_in: gen_args += ["--udp-in", str(raw_udp_in)]
+    _gen_err = sys.stderr if raw_udp_in else subprocess.DEVNULL
+    gen = _popen(gen_args,
+          stdout=subprocess.PIPE, stderr=_gen_err, env=env)
+    tx = _popen([pybin()]+txargs+["--source","fd","--in-fd","0"],
+          stdin=gen.stdout, stderr=open(rp("dvbs2_tx.radio.log"),"w"), env=env)
+    return [gen, tx]
+
+# =============================================================================
+def cmd_rates(cfg):
+    for d in ("tx", "rx"):
+        s = cfg.get(d, {})
+        if not s: continue
+        mc = s["modcod"]; fr = s.get("frame_size","normal"); sr = float(s["symbol_rate"])
+        if is_auto(mc):
+            print(f"[{d}] auto @ {sr/1e6:.3f} MSym/s : low-latency | ACM/VCM | "
+                  f"RX detects MODCOD per-frame from the PL header (QPSK/8PSK)")
+            continue
+        net = net_ts_bps(mc, fr, sr, bool(s.get("pilots", True)))
+        vb = net * 0.82
+        res = cfg.get("payload",{}).get("resolution","auto")
+        if res == "auto": res = auto_resolution(vb)
+        eng = "low-latency" if engine_for(mc)=="lowlat" else "extended (APSK)"
+        tg = tier(mc); lat = latency_str(mc, sr, fr)
+        print(f"[{d}] {mc} {fr} @ {sr/1e6:.3f} MSym/s : net {net/1e6:.2f} Mbps | "
+              f"video ~{vb/1e6:.2f} Mbps | res {res} | mode {eng} | {tg} | latency {lat}")
+        if tg == "APSK":
+            print(f"     !! {mc} uses the extended engine; LATENCY ~1.5-2 s "
+                  f"(acknowledged). Needs a clean/cabled link.")
+        elif tg == "margin":
+            print(f"     ~  {mc} is margin-dependent (runs if link margin allows; "
+                  f"robust set = QPSK 1/2-2/3, 8PSK 3/5-2/3).")
+
+def cmd_check(cfg, loopback=False):
+    ok = True
+    def chk(label, cond, extra=""):
+        nonlocal ok; ok = ok and cond
+        print(f"  [{'OK ' if cond else 'XX '}] {label}{(' - '+extra) if extra else ''}")
+    print("== DVBS2_TR preflight ==" + (" (loopback)" if loopback else ""))
+    chk("runtime present", os.path.isdir(ENV))
+    have_py = os.path.exists(pybin())
+    chk("runtime interpreter", have_py)
+    #chk("transmit core", os.path.exists(app("dvbs2-tx")))
+    #chk("receive core", os.path.exists(app("dvbs2-rx")))
+    chk("media tool", os.path.exists(FFMPEG) or shutil.which("ffmpeg") is not None)
+    # probe the runtime ONLY if its interpreter exists; never let a missing/foreign
+    # runtime raise (a traceback could print source naming the backend).
+    def _probe(code):
+        if not have_py: return None
+        try: return subprocess.run([pybin(),"-c",code], env=gr_env(), capture_output=True, text=True)
+        except Exception: return None
+    def _probe_any(*codes):
+        """Try each probe in order; return the first that succeeds. Keeps the
+        check working before and after an engine-rename pass that swaps the
+        internal package names."""
+        last = None
+        for c in codes:
+            r = _probe(c)
+            if r and r.returncode == 0: return r
+            last = r
+        return last
+    r = _probe_any("from sdrcore import link",
+                   "from gnuradio import link")
+    chk("modem core", bool(r) and r.returncode == 0, "" if (r and r.returncode == 0) else "not loadable")
+    if loopback:
+        chk("loopback OK", True, "radio probe skipped (--loopback)")
+    else:
+        u = _probe_any("import rf; print(len(rf.find('type=b200')))",
+                       "import uhd; print(len(uhd.find('type=b200')))")
+        ndev = u.stdout.strip() if u else ""
+        chk("radio (B210) detected", bool(u) and u.returncode == 0 and ndev not in ("", "0"), f"{ndev} device(s)")
+    # HW H.264 encoder (Jetson nvv4l2h264enc) - informational, does not gate
+    # readiness. Honors [payload].encoder so an operator who picked 'sw' sees
+    # an expected status instead of a scary [-- ] for a feature they didn't ask for.
+    enc_sel = ((cfg.get("payload") or {}).get("encoder", "hw")).lower()
+    hw = have_hw_encoder()
+    if enc_sel == "sw":
+        print(f"  [OK ] live video encoder = sw (libx264 via ffmpeg)"
+              f"{' ; HW available but not selected' if hw else ''}")
+    else:
+        print(f"  [{'OK ' if hw else '-- '}] live video encoder = hw (nvv4l2h264enc) "
+              f"{'present' if hw else 'not available - re-run with --encoder sw or set [payload].encoder = sw'}")
+    # config rates
+    try: cmd_rates(cfg); chk("config + net-rate calc", True)
+    except SystemExit as e: chk("config + net-rate calc", False, str(e))
+    print("== %s ==" % ("ALL GOOD - link ready" if ok else "PROBLEMS FOUND"))
+    return 0 if ok else 1
+
+def build_ffmpeg_encode(src, res, vbps, muxrate, fps):
+    """ffmpeg args to encode `src` to CBR mpegts on stdout (video only).
+    Tuned for low end-to-end latency in live mode (v4l2/udp/pipe): no
+    B-frames, no scene-cut keyframe injection, GOP=fps (1 s keyframe
+    interval), zerolatency tune, half-second rate-control buffer, no
+    input buffering, flush mpegts packets immediately.
+
+    SW-fallback path. The Jetson NVENC path is build_gst_encode below;
+    dispatch is build_encode."""
+    vb = f"{int(vbps/1000)}k"
+    bufsz = f"{max(1, int(vbps/2/1000))}k"
+    pre = [FFMPEG,"-hide_banner","-loglevel","error","-fflags","nobuffer"]
+    if src.startswith("file:"):
+        pre += ["-stream_loop","-1","-i",src[5:]]
+    elif src.startswith("v4l2:"):
+        pre += ["-f","v4l2","-framerate",str(fps),"-i",src[5:]]
+    elif src.startswith("udp://") or src.startswith("pipe"):
+        pre += ["-i", "pipe:0" if src=="pipe" else src]
+    else:
+        pre += ["-stream_loop","-1","-i",src]
+    return pre + ["-an","-sn","-vf",f"scale={res},fps={fps}","-c:v","libx264",
+        "-preset","ultrafast","-tune","zerolatency","-bf","0",
+        "-pix_fmt","yuv420p","-b:v",vb,"-maxrate",vb,"-bufsize",bufsz,
+        "-g",str(fps),"-keyint_min",str(fps),"-sc_threshold","0",
+        "-x264-params","nal-hrd=cbr:force-cfr=1:no-mbtree=1",
+        "-flush_packets","1",
+        "-f","mpegts","-muxrate",str(int(muxrate)),
+        "-mpegts_flags","+pat_pmt_at_frames",
+        "pipe:1"]
+
+def check_display_or_exit():
+    """Die with a clear message if sink=display but no X display is reachable.
+    ffplay silently crashes without DISPLAY, which blocks the pipeline pipe and
+    causes the whole link to stall ~3 seconds in with no useful error."""
+    disp = os.environ.get("DISPLAY", "")
+    if disp:
+        return   # DISPLAY is set — let ffplay attempt it
+    sys.exit(
+        "error: sink = \"display\" requires an X display, but $DISPLAY is not set.\n"
+        "  This usually means you are connected via SSH without X forwarding.\n"
+        "\n"
+        "  Options:\n"
+        "    1. Stream to another machine instead:\n"
+        "         set  sink = \"udp://VIEWER_IP:1234\"  in link.toml\n"
+        "         run  ffplay -fflags nobuffer -i udp://0.0.0.0:1234  on VIEWER_IP\n"
+        "\n"
+        "    2. Forward X over SSH (if the machine has a display):\n"
+        "         ssh -X wftest@MACHINE_IP\n"
+        "         then re-run dvbs2_TR\n"
+        "\n"
+        "    3. Run from a local terminal on the Jetson (not SSH)."
+    )
+
+_HW_ENC_CACHE = None
+def have_hw_encoder():
+    """True iff the Jetson HW H.264 encoder element (nvv4l2h264enc) is loadable
+    on this host. Probed via gst-inspect-1.0; cached because cmd_check + cmd_tx
+    + cmd_duplex all ask."""
+    global _HW_ENC_CACHE
+    if _HW_ENC_CACHE is not None: return _HW_ENC_CACHE
+    gi = shutil.which("gst-inspect-1.0")
+    if not gi: _HW_ENC_CACHE = False; return False
+    try:
+        r = subprocess.run([gi, "nvv4l2h264enc"], capture_output=True, text=True,
+                           env=media_env(), timeout=5)
+        _HW_ENC_CACHE = (r.returncode == 0)
+    except Exception:
+        _HW_ENC_CACHE = False
+    return _HW_ENC_CACHE
+
+def build_gst_encode(src, res, vbps, muxrate, fps):
+    """Jetson HW path: GStreamer pipeline for v4l2 -> nvv4l2h264enc -> raw
+    h264 on stdout, piped through ffmpeg's mpegts muxer for CBR muxrate
+    padding. The two-process bash -c wrapper lets us mirror build_ffmpeg_encode's
+    argv contract (stdin/stdout = pipe) so the existing _popen plumbing is
+    unchanged.
+
+    Why two stages: GStreamer's mpegtsmux doesn't accept a target muxrate -
+    it packs h264 + the bare minimum nulls, producing a variable-rate TS
+    that bursts at GOP boundaries. dvbs2-tx's BBFRAME assembler reads at
+    the link's net rate; bursty input lets the pipe buffer up between
+    keyframes and drain back, which propagates as TX timing irregularity
+    and (verified on Xavier) breaks RX DEMOD after ~10 s. ffmpeg's mpegtsmux
+    accepts -muxrate and pads constant-rate, which is what the link needs.
+
+    Properties pulled from the gst-inspect probe (low-latency DVB-S2 recipe):
+    control-rate=1 CBR, every-I-is-IDR, SPS/PPS+VUI+AUD inserted, UltraFast
+    preset, maxperf, no B-frames, Main profile (poc-type=2 needs it).
+    videoconvert+videoscale+videorate front-end so any webcam pixel format
+    (YUY2/MJPEG/NV12) negotiates cleanly into nvvidconv's NVMM NV12 input."""
+    gst = shutil.which("gst-launch-1.0")
+    if not gst:
+        raise RuntimeError("gst-launch-1.0 not found; --encoder hw needs GStreamer + the nvv4l2 plugin set")
+    if not src.startswith("v4l2:"):
+        raise ValueError("--encoder hw currently supports v4l2 sources only "
+                         "(file: uses the preencode cache; udp:/pipe not yet HW-wired)")
+    dev = src[5:]
+    try: W, H = (int(x) for x in str(res).lower().split("x", 1))
+    except Exception:
+        raise ValueError(f"--encoder hw needs an explicit WxH resolution (got {res!r}); "
+                         "set [payload].resolution = '854x480' or use --encoder sw")
+    vbps = int(vbps); fps = int(fps); muxrate = int(muxrate)
+    vbv = max(100000, int(vbps / max(1, fps) * 5))    # ~5-frame VBV for tight CBR
+    import shlex as _sx
+    gst_argv = [gst, "-q",
+        "v4l2src", f"device={dev}", "!",
+        "video/x-raw", "!",
+        "videoconvert", "!",
+        "videoscale", "!",
+        "videorate", "!",
+        f"video/x-raw,format=I420,width={W},height={H},framerate={fps}/1", "!",
+        "nvvidconv", "!",
+        "video/x-raw(memory:NVMM),format=NV12", "!",
+        "nvv4l2h264enc",
+        f"bitrate={vbps}", "control-rate=1",
+        f"iframeinterval={fps}", f"idrinterval={fps}",
+        "insert-sps-pps=true", "insert-vui=true", "insert-aud=true",
+        "preset-level=1", "maxperf-enable=true",
+        "num-B-Frames=0", "num-Ref-Frames=1",
+        "profile=2", "poc-type=2",
+        f"vbv-size={vbv}",
+        "!", "h264parse", "config-interval=1",
+        "!", "fdsink", "fd=1", "sync=false"]
+    ff_argv = [FFMPEG, "-hide_banner", "-loglevel", "error",
+        "-fflags", "nobuffer", "-f", "h264", "-i", "-",
+        "-c", "copy", "-flush_packets", "1",
+        "-f", "mpegts", "-muxrate", str(muxrate),
+        "-mpegts_flags", "+pat_pmt_at_frames",
+        "pipe:1"]
+    gst_sh = " ".join(_sx.quote(x) for x in gst_argv)
+    ff_sh  = " ".join(_sx.quote(x) for x in ff_argv)
+    return ["bash", "-c", f"{gst_sh} | {ff_sh}"]
+
+def build_encode(src, res, vbps, muxrate, fps, encoder):
+    """Dispatch the live-source encoder per --encoder / [payload].encoder.
+    'hw' = Jetson nvv4l2h264enc via gst-launch-1.0 (default on Jetson hosts);
+    'sw' = libx264 via ffmpeg (portable fallback). 'hw' FAILS LOUD (raises)
+    when the element is missing or the source/resolution is unsupported,
+    so the operator gets one clear error instead of a silently-degraded
+    link with surprise CBR behavior."""
+    if encoder == "hw":
+        if not have_hw_encoder():
+            raise RuntimeError("--encoder hw requested but nvv4l2h264enc is not available on this host; "
+                               "re-run with --encoder sw or set [payload].encoder = 'sw' in link.toml")
+        return build_gst_encode(src, res, vbps, muxrate, fps)
+    return build_ffmpeg_encode(src, res, vbps, muxrate, fps)
+
+def usrp_args(cfg, d):
+    # per-direction device_args (bench: two B210s) overrides [node] (deployment: one B210)
+    return cfg.get(d,{}).get("device_args") or cfg.get("node",{}).get("device_args","type=b200")
+
+def samp_type_of(cfg):
+    """Over-the-wire IQ format threaded into dvbs2-tx/-rx + gr_fullduplex.py.
+    sc8 halves the USB bytes/sample vs sc16 — useful when the host can't drain
+    samp_rate*sps fast enough (the 'OOOO' overflow signature in the radio log)."""
+    val = (cfg.get("node",{}) or {}).get("samp_type", "sc16")
+    return val if val in ("sc16","sc8") else "sc16"
+
+def raw_payload_text(cfg):
+    """[raw].payload string for --raw mode. When set, rawdata_gen formats each
+    frame as '<text> : <SEQ>' (padded with NUL to plen) and rawdata_rx prints
+    the decoded text on every tick. The operator literally watches the counter
+    increment. Empty string == legacy synthetic byte pattern (no print)."""
+    return (cfg.get("raw") or {}).get("payload", "")
+
+def low_lat_stream_args():
+    """UHD host-side queue caps. send_buff_size/recv_buff_size are honored only
+    by the UDP transport (X3xx/N3xx); the B210 libusb transport silently ignores
+    them and sizes its URB ring by num_send_frames*send_frame_size and
+    num_recv_frames*recv_frame_size. Without those keys the duplex pipeline
+    ramps to ~4 s steady-state on a single B210 (libusb default ring + FX3 FIFO
+    + FPGA SRAM ~= 64 MB / 16 MB/s). 8 frames * 16384 B = 128 KiB per direction
+    ~= 8 ms host queue at 16 MB/s; FX3/FPGA + BBFRAME/OTA/FEC bring duplex
+    steady-state into the ~250-400 ms band. Bench mode (separate TX/RX radios)
+    lands lower because each libusb path carries only one direction."""
+    return ("send_buff_size=2097152,recv_buff_size=2097152,"
+            "num_send_frames=8,send_frame_size=16384,"
+            "num_recv_frames=8,recv_frame_size=16384")
+
+def preencode_file(srcpath, res, vb, net, fps):
+    """encode a video file to a cached CBR mpegts once; return the cache path."""
+    if not os.path.exists(srcpath):
+        sys.exit(f"error: video source not found: {srcpath}\n"
+                 f"  Drop a clip at {srcpath}, or edit [payload].source in link.toml,\n"
+                 f"  or use --raw for a no-video link test.")
+    vbk = f"{int(vb/1000)}k"
+    cache = rp(f"dvbs2_enc_{res}_{int(vb)}_{int(net)}.ts")
+    if not os.path.exists(cache):
+        print(f"pre-encoding {srcpath} -> {res}@{vb/1e6:.2f}Mbps (cache) ...")
+        r = subprocess.run([FFMPEG,"-hide_banner","-loglevel","error","-stream_loop","-1","-t","60",
+            "-i",srcpath,"-an","-sn","-vf",f"scale={res},fps={fps}","-c:v","libx264","-preset",
+            "veryfast","-pix_fmt","yuv420p","-b:v",vbk,"-maxrate",vbk,"-bufsize",vbk,"-g",str(fps),
+            "-sc_threshold","0","-f","mpegts","-muxrate",str(int(net)),cache], env=media_env())
+        if r.returncode != 0 or not os.path.exists(cache):
+            sys.exit(f"error: ffmpeg encoding failed for {srcpath} (exit {r.returncode}).\n"
+                     f"  Check the file is a valid video. Use --raw for a no-video test.")
+    return cache
+
+# ---- extended engine (APSK path) -----------------------------------------
+SNAP = os.environ.get("DVBS2_APSK_HOME") or "/snap/sdrangel/current"
+_TRIPLET = f"{platform.machine()}-linux-gnu"      # x86_64- / aarch64- as appropriate
+# Internals of the APSK ("extended") path. The upstream package lays out files
+# under <SNAP>/opt/install/<pkg>/{bin,lib}. We keep that path layout but the
+# operator-facing names (functions, comments, error messages) all say
+# "extended engine" — no library-identifier leaks into the driver source.
+_EXT_PKG = "sdrangel"   # upstream package dir name (NOT operator-facing)
+def _extended_engine_env():
+    e = dict(os.environ); S = SNAP
+    e["LD_LIBRARY_PATH"] = ":".join([f"{S}/opt/install/{_EXT_PKG}/lib/{_EXT_PKG}",
+        f"{S}/opt/install/{_EXT_PKG}/lib", f"{S}/usr/lib/{_TRIPLET}", f"{S}/usr/lib", f"{S}/lib"])
+    return e
+
+def launch_extended_engine():
+    import urllib.request
+    subprocess.run(["pkill","-9","-x",f"{_EXT_PKG}srv"]); time.sleep(2)
+    p = _popen([f"{SNAP}/opt/install/{_EXT_PKG}/bin/{_EXT_PKG}srv"],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_extended_engine_env())
+    for _ in range(30):
+        time.sleep(1)
+        try: urllib.request.urlopen(f"http://127.0.0.1:8091/{_EXT_PKG}", timeout=2); return p
+        except Exception: pass
+    print("!! extended engine did not start on :8091"); return p
+
+def extended_engine_warn(mc):
+    print(f"!! {mc} is APSK -> using the extended engine (the low-latency path is QPSK/8PSK only).")
+    print(f"!! WARNING: latency will be HIGH (~1.5-2 s), NOT sub-second. Proceeding (acknowledged).")
+
+def extended_engine_run(cfg, mode, secs):
+    """APSK link via the extended engine, invoked transparently (mod TX + demod RX)."""
+    s = cfg["tx"]; mc = s["modcod"]; fr = s.get("frame_size","normal"); sr = float(s["symbol_rate"])
+    mod, fec = sa_indices(mc)
+    # find_helper looks for the file under .internal/, internal/, alongside the
+    # driver, or in ../scripts. Prefers the new neutral name; the old name kept
+    # as a fallback for any pre-rename bundle that's already in the field.
+    ext_link = find_helper("extended_datv_link.py")
+    if not os.path.exists(ext_link):
+        ext_link = find_helper("sdrangel_datv_link.py")
+    extended_engine_warn(mc)
+    net = net_ts_bps(mc, fr, sr, bool(s.get("pilots",True))); vb = net*0.82
+    pl = cfg.get("payload",{}); src = pl.get("source","file:"+os.path.join(HERE, "media", "sample.mp4"))
+    res = pl.get("resolution","auto");  res = auto_resolution(vb) if res=="auto" else res
+    cache = preencode_file(src[5:] if src.startswith("file:") else src, res, vb, net, int(pl.get("framerate",25)))
+    dev_freq = int(float(s["freq_hz"])) - 2000000     # device freq; +2 MHz channel offset -> signal at freq_hz
+    base = [pybin(), ext_link, f"symrate={int(sr)}", "samprate=8000000", f"freq={dev_freq}",
+            f"modulation={mod}", f"fec={fec}", f"rfbw={int(sr*1.35)}", f"tsfile={cache}",
+            f"txgain={s.get('gain_db',89)}", f"rxgain={cfg.get('rx',{}).get('gain_db',40)}",
+            "rolloff=%g" % s.get("rolloff",0.35)]
+    sub = {"bench":"config", "tx":"txonly", "rx":"rxonly"}[mode]
+    launch_extended_engine()
+    subprocess.run([base[0], base[1], sub] + base[2:], env=media_env())
+    if mode == "bench":                      # full link needs an explicit start; txonly/rxonly self-run
+        subprocess.run([pybin(), ext_link, "start"], env=media_env())
+    if mode == "tx":
+        print("APSK transmit running (Ctrl-C to stop).");
+        try:
+            while True: time.sleep(1)
+        except KeyboardInterrupt: pass
+        return
+    # bench / rx: read recovered TS on udpTS:5005
+    time.sleep(8)
+    print(f"reading recovered TS (udpTS:5005) for {secs}s ...")
+    import socket
+    so = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); so.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    so.bind(("0.0.0.0", cfg.get("rx",{}).get("rxudp",5005) if False else 5005)); so.settimeout(1.0)
+    t0 = time.time(); last={}; cc_err=0; pkts=0; bytes_rx=0
+    while time.time()-t0 < secs:
+        try: d = so.recv(65536)
+        except socket.timeout: continue
+        bytes_rx += len(d)
+        for i in range(0, len(d)-187, 188):
+            if d[i]!=0x47: continue
+            pid=((d[i+1]&0x1f)<<8)|d[i+2]; ccv=d[i+3]&0xf; afc=(d[i+3]>>4)&3
+            if pid==0x100 and afc in (1,3):
+                pkts+=1
+                if pid in last and ccv!=((last[pid]+1)&0xf): cc_err+=1
+                last[pid]=ccv
+    mbps = bytes_rx*8/secs/1e6
+    print(f">> APSK {mc}: recovered video PID 0x100 = {pkts} pkts, {cc_err} continuity errors, "
+          f"{mbps:.2f} Mbps over {secs}s  (latency ~1.5-2 s, as warned)")
+
+def _wait_radio_ready(proc, kind, max_wait=30):
+    """Print a 'bringing the radio up ...' line, then wait until the modem core
+    logs that it has set the master clock (meaning UHD has the device open) — or
+    the process exits (failure). Returns True if ready, False if the modem core
+    died early (caller should report a friendly error).
+
+    kind = 'tx' | 'rx' | 'dx' — selects which radio log to watch.
+    """
+    log_path = rp({"tx":"dvbs2_tx.radio.log",
+                   "rx":"dvbs2_rx.radio.log",
+                   "dx":"dvbs2_dx.radio.log"}[kind])
+    print(f"  [.] bringing the radio up (cold start can take up to ~10 s while the FPGA loads) ...",
+          flush=True)
+    t0 = time.time()
+    last_dot = t0
+    while proc.poll() is None and time.time() - t0 < max_wait:
+        try:
+            with open(log_path, "r") as f:
+                text = f.read()
+                if "Actually got clock rate" in text:
+                    print(f"  [+] radio ready ({time.time()-t0:.1f} s) — link starting",
+                          flush=True)
+                    return True
+        except FileNotFoundError:
+            pass
+        if time.time() - last_dot > 1.0:
+            print("      ... still bringing it up", flush=True); last_dot = time.time()
+        time.sleep(0.3)
+    if proc.poll() is not None:
+        print("  [x] the radio did not come up — verify the serial in link.toml matches "
+              "the attached B210 and that no other process is holding the radio.")
+        try:
+            with open(log_path, "r") as f:
+                msg = [ln for ln in f.read().splitlines()
+                       if any(k in ln for k in ("Error","error","not found","Unable","Could not"))]
+                for ln in msg[-3:]: print(f"      | {ln}")
+        except FileNotFoundError:
+            pass
+        return False
+    print(f"  [+] radio ready (no clock marker in {max_wait} s — proceeding anyway)", flush=True)
+    return True
+
+def tx_stats_loop(proc, cfg, mode_label, writer=None):
+    """Per-second TX readout while transmitting. PLFRAME rate is deterministic at a
+    fixed symbol rate; the count is elapsed-based. If `writer` is provided
+    (cmd_duplex --full-stats two-column path), the line body is routed through
+    it for column alignment; otherwise it prints standalone with a coloured
+    [TX MM:SS] prefix."""
+    s = cfg["tx"]; mc = s["modcod"]; fr = s.get("frame_size","normal"); sr = float(s["symbol_rate"])
+    pil = bool(s.get("pilots", True)); pl = "pilots" if pil else "no-pilots"
+    fps = frame_rate(mc, fr, sr, pil); net = net_ts_bps(mc, fr, sr, pil)
+    if not _wait_radio_ready(proc, "tx"): _kill_all(); return
+    t0 = writer.t0 if writer is not None else time.time()
+    if writer is None:
+        print(f"  TX STATS [{mc} {fr} {pl} {sr/1e6:.3f} MSym/s | {mode_label}] -- elapsed | PLFRAME rate | sent:")
+    try:
+        while proc.poll() is None:
+            time.sleep(1.0)
+            e = int(time.time()-t0)
+            # 'link' = DVB-S2 link gross rate at this MODCOD/SR/frame/pilots
+            # (the modulator's deterministic capacity). In --raw the actual app
+            # data rate from rawdata_gen is usually a fraction of this and is
+            # padded with NULL TS packets up to 'link' — the RX side's per-sec
+            # Mbps reflects the app rate, not 'link'. Both numbers are correct.
+            body = (f"{mc} {fr} {pl} @ {sr/1e6:.3f} MSym/s | {mode_label} | "
+                    f"{fps:.0f} PLFRAME/s, {int(e*fps)} sent | link {net/1e6:.2f} Mbps")
+            if writer is not None:
+                writer.tx(e, body)
+            else:
+                el = f"{e//60:02d}:{e%60:02d}"
+                print(f"  \033[1;36m[TX {el}]\033[0m {body}", flush=True)
+    except KeyboardInterrupt:
+        pass
+    _kill_all()
+
+def cmd_tx(cfg, raw, encoder=None, raw_udp_in=0):
+    if engine_for(cfg["tx"]["modcod"]) == "extended":   # APSK -> extended engine, transparently
+        return extended_engine_run(cfg, "tx", 0)
+    if raw:
+        tx_stats_loop(spawn_tx_raw(cfg, raw_udp_in=raw_udp_in)[-1], cfg, "raw-data"); return
+    txargs, mc, fr, sr, net = tx_args(cfg)
+    pl = cfg.get("payload",{}); src = pl.get("source","file:"+os.path.join(HERE, "media", "sample.mp4"))
+    res = pl.get("resolution","auto"); vb = net*0.82
+    if res == "auto": res = auto_resolution(vb)
+    fps = int(pl.get("framerate",25))
+    if src.startswith("file:"):
+        # FILE source -> pre-encode once to a cached CBR mpegts, then stream the file
+        # (avoids live x264 fighting the realtime demod for CPU on encode-less hosts).
+        cache = preencode_file(src[5:], res, vb, net, fps)
+        print(f"TX video (file): {cache} -> {mc} {fr} @ {sr/1e6:.3f} MSym/s")
+        tx = _popen([pybin()]+txargs+["--source","file","--in-file",cache,"--in-repeat"],
+              stderr=open(rp("dvbs2_tx.radio.log"),"w"), env=gr_env())
+        tx_stats_loop(tx, cfg, "video (file)"); return
+    enc = (encoder or pl.get("encoder", "hw")).lower()
+    print(f"TX video (live, encoder={enc}): {src} -> {res}@{vb/1e6:.2f}Mbps -> {mc} {fr} @ {sr/1e6:.3f} MSym/s")
+    ff = _popen(build_encode(src,res,vb,net,fps,enc),
+          stdout=subprocess.PIPE, stderr=open(rp("dvbs2_tx.enc.log"),"w"), env=media_env())
+    tx = _popen([pybin()]+txargs+["--source","fd","--in-fd","0"],
+          stdin=ff.stdout, stderr=open(rp("dvbs2_tx.radio.log"),"w"), env=gr_env())
+    tx_stats_loop(tx, cfg, "video (live)")
+
+def poll_full_stats(port, cfg, proc, writer=None, loopback=False, skip_radio_wait=False):
+    """Poll dvbs2-rx --mon-server JSON once/second -> rich receiver line. Polls on a
+    timer (independent of TS flow) so it ALWAYS ticks - including during a signal
+    drop - with elapsed time. SNR(Es/N0), CFO, LDPC iters, FER are exported; symbol-
+    timing & phase offset are internal to the receiver and not exported.
+
+    'DEMOD' replaces the previous 'LOCK' label so the green tag here does not
+    collide with the green 'VIDEO' tag printed by ts_tee_stats.py (separate
+    concepts: PHY sync vs. TS bytes flowing). When `writer` is provided this
+    routes the line body through it for two-column duplex alignment."""
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never proxy localhost
+    s = cfg["rx"]; mc = s["modcod"]; fr = s.get("frame_size","normal"); sr = float(s["symbol_rate"])
+    pilots = bool(s.get("pilots", True))
+    auto = is_auto(mc)
+    # Expected TS packets/sec for every candidate MODCOD the low-latency path can lock
+    # to (QPSK/8PSK on this symrate/frame/pilots config). Used (a) to label the
+    # detected MODCOD when -m auto is in force, and (b) to flag a MODCOD mismatch
+    # when the operator launched RX with a concrete -m that no longer matches the
+    # TX (LDPC stuck at the ceiling, FER ~100%, zero TS recovered).
+    _CAND_MC = ("QPSK1/2","QPSK3/5","QPSK2/3","QPSK3/4","QPSK4/5","QPSK5/6","QPSK8/9",
+                "8PSK3/5","8PSK2/3","8PSK3/4","8PSK5/6","8PSK8/9")
+    expect_tp = {}
+    for _cmc in _CAND_MC:
+        try:
+            expect_tp[_cmc] = net_ts_bps(_cmc, fr, sr, pilots) / (188 * 8)
+        except SystemExit:
+            pass
+    # The duplex path writes to dx.radio.log, plain RX to rx.radio.log; pick by sniffing the cfg.
+    kind = "dx" if (cfg.get("tx") and cfg.get("rx") and
+                    cfg["tx"].get("freq_hz") != cfg["rx"].get("freq_hz")) else "rx"
+    if loopback:
+        print("  [+] loopback — no radio init, flowgraph starts immediately", flush=True)
+    elif not skip_radio_wait and not _wait_radio_ready(proc, kind):
+        _kill_all(); return
+    # Track USB host-buffer overflows: UHD writes an 'O' to its log every time
+    # the host couldn't drain a sample in time. We tail the relevant radio log
+    # between ticks and surface the count on the per-second line so the
+    # operator sees it without grep'ing — overflow bursts directly cause
+    # symbol loss → "lock break" with no obvious cause in the JSON metrics.
+    _of_log = rp({"rx":"dvbs2_rx.radio.log","dx":"dvbs2_dx.radio.log"}[kind])
+    _of_pos = 0
+    _of_total = 0
+    try:
+        # Seek to end at the start so we don't count pre-existing overflows
+        # from the init phase.
+        with open(_of_log, "rb") as _fl: _fl.seek(0, 2); _of_pos = _fl.tell()
+    except FileNotFoundError:
+        pass
+    t0 = writer.t0 if writer is not None else time.time()
+    if writer is None:
+        print(f"  RX FULL STATS [{mc} {fr} {sr/1e6:.3f} MSym/s] -- elapsed | demod | SNR(Es/N0) | CFO | "
+              f"LDPC iters | FER | TS  (ticks every 1 s):")
+    prev_f = prev_e = prev_p = 0
+    def _emit_rx(e, body, raw_only=False):
+        """Route an RX-side body through the writer when present, else print
+        with the coloured prefix inline."""
+        if writer is not None:
+            writer.rx(e, body)
+        else:
+            el = f"{e//60:02d}:{e%60:02d}"
+            print(f"  \033[1;34m[RX {el}]\033[0m {body}", flush=True)
+    try:
+        while proc.poll() is None:
+            time.sleep(1.0)
+            e = int(time.time()-t0)
+            try:
+                j = json.loads(opener.open(f"http://127.0.0.1:{port}/", timeout=2.5).read())
+            except Exception:
+                _emit_rx(e, f"{mc} {fr} | (waiting for receiver monitor ...)"); continue
+            pl = j.get("plsync") or {}; fec = j.get("fec") or {}; tsd = j.get("mpeg-ts") or {}
+            cfo = pl.get("freq_offset_hz")
+            if not j.get("lock"):
+                cs = f" | CFO {cfo/1e3:+.1f} kHz" if cfo is not None else ""
+                _emit_rx(e, f"{mc} {fr} | \033[1;31mNO DEMOD\033[0m (searching){cs}"); continue
+            snr = j.get("snr"); it = fec.get("avg_ldpc_trials")
+            f = fec.get("frames") or 0; ee = fec.get("errors") or 0; tp = tsd.get("packets") or 0
+            df = f - prev_f; de = ee - prev_e; dtp = tp - prev_p; prev_f, prev_e, prev_p = f, ee, tp
+            ifer = (de / df * 100) if df > 0 else 0.0          # per-second (instantaneous) FER
+            snr_s = f"{snr:4.1f} dB" if snr is not None else "  ?  "
+            cfo_s = f"{cfo/1e3:+.1f} kHz" if cfo is not None else "?"
+            it_s  = f"{it:.1f}" if it is not None else "?"
+            # --- MODCOD label + mismatch detection ----------------------------
+            # In -m auto (ACM/VCM) mode we don't know which MODCOD the demod has
+            # actually locked onto, but the recovered TS rate uniquely identifies
+            # it (each MODCOD has a distinct net TS bitrate at a fixed symrate/
+            # frame/pilots). Compare against the pre-built table.
+            mc_label = mc
+            auto_matched = False
+            if auto and dtp > 50 and expect_tp:
+                _bmc, _btp = min(expect_tp.items(), key=lambda kv: abs(dtp - kv[1]))
+                if _btp > 0 and abs(dtp - _btp) / _btp <= 0.05:
+                    mc_label = f"auto -> {_bmc}"
+                    auto_matched = True
+                else:
+                    mc_label = "auto(?)"
+            # Mismatch = receiver clearly trying but failing to decode (LDPC pinned
+            # at the iteration ceiling, near-100% FER, no TS coming out) OR auto
+            # mode is seeing TS at a rate that matches no candidate within 10%.
+            mismatch = False
+            if (it is not None and it >= 24 and ifer > 50.0 and dtp < 50):
+                mismatch = True
+            elif auto and dtp > 50 and expect_tp:
+                _bmc2, _btp2 = min(expect_tp.items(), key=lambda kv: abs(dtp - kv[1]))
+                if _btp2 <= 0 or abs(dtp - _btp2) / _btp2 > 0.10:
+                    mismatch = True
+            # Read any new bytes appended to the radio log and count 'O' marks.
+            of_delta = 0
+            try:
+                with open(_of_log, "rb") as _fl:
+                    _fl.seek(_of_pos)
+                    _new = _fl.read()
+                    _of_pos = _fl.tell()
+                of_delta = _new.count(b"O")
+            except FileNotFoundError:
+                pass
+            _of_total += of_delta
+            of_tag = f" | \033[1;33mUSB OF +{of_delta} (sum {_of_total})\033[0m" if of_delta else ""
+            _emit_rx(e, f"{mc_label} {fr} | \033[1;32mDEMOD\033[0m | SNR(Es/N0) {snr_s} | CFO {cfo_s} | "
+                        f"LDPC {it_s} it/frm | FER {ifer:5.2f}%/s | {df} frm/s, {dtp} TS pkt/s{of_tag}")
+            if mismatch:
+                _emit_rx(e, "[!] MODCOD mismatch suspected (LDPC at ceiling, FER ~100%, 0 TS)."
+                            " The TX MODCOD likely changed since RX started. Re-run RX with"
+                            " '-m auto' OR restart with the matching -m <MODCOD>.")
+            if of_delta > 5:
+                # First-line fix is sc8: halves wire bytes / sample, ENOB drop
+                # is negligible for DVB-S2 at typical lock SNRs (>5 dB margin).
+                # Second is to drop RX oversample (and the lo_offset_hz with it).
+                # Third is to max out clocks/fan on the Jetson if you have sudo.
+                _emit_rx(e, "[!] USB host-buffer overflows: host can't drain samples in time.")
+                _emit_rx(e, '    Edit link.toml: [node] samp_type = "sc8"  (halves wire bytes)')
+                _emit_rx(e, "    OR: drop [rx] oversample 4 -> 2 (also halve lo_offset_hz)")
+                _emit_rx(e, "    AND/OR: 'sudo jetson_clocks' on the Jetson if you can")
+    except KeyboardInterrupt:
+        raise                                # let the supervisor / main stop cleanly
+
+def cmd_rx(cfg, raw, full_stats=False, raw_udp_out=""):
+    if engine_for(cfg["rx"]["modcod"]) == "extended":   # APSK -> extended engine, transparently
+        return extended_engine_run(cfg, "rx", 10**9)
+    s = cfg["rx"]; fr = s.get("frame_size","normal")
+    sr = float(s["symbol_rate"]); sps = int(s.get("oversample",4)); loff = float(s.get("lo_offset_hz", 2e6))
+    auto = is_auto(s["modcod"])                       # ACM/VCM: detect MODCOD per-frame
+    mc_app = "QPSK1/2" if auto else modcod_for_app(s["modcod"])   # placeholder for ACM init
+    mc = "auto(ACM)" if auto else mc_app              # display label
+    pilots = "auto" if auto else ("on" if s.get("pilots",True) else "off")
+    rxargs = [app("dvbs2-rx"),"-m",mc_app,"-p",pilots,
+              "-s",str(int(sr)),"--sps",str(sps),"--frame-size",fr,
+              "--source","usrp","--usrp-args",usrp_args(cfg,"rx"),
+              "--usrp-antenna",s.get("antenna","RX2"),
+              "--usrp-gain",str(s.get("gain_db",40)),"--usrp-lo-offset",str(int(loff)),
+              "-f",str(int(float(s["freq_hz"]))),
+              "--usrp-otw-format", samp_type_of(cfg),
+              "--usrp-stream-args", low_lat_stream_args()]
+    if auto: rxargs += ["--pl-acm-vcm"]               # accept all MODCODs; detect from PL header
+    if full_stats: rxargs += ["--mon-server","--mon-port",str(MONPORT)]
+    env = media_env()
+    rxcmd = gr_shell_prefix() + "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
+    UHD = f"2>{rp('dvbs2_rx.radio.log')}"
+    if raw:
+        print(f"RX raw-data readout: {mc} {fr} @ {sr/1e6:.3f} MSym/s"
+              + (f"  | UDP-out {raw_udp_out}" if raw_udp_out else ""))
+        import shlex
+        pt = raw_payload_text(cfg)
+        pt_arg = f" --payload-text {shlex.quote(pt)}" if pt else ""
+        udp_out_arg = f" --udp-out {shlex.quote(raw_udp_out)}" if raw_udp_out else ""
+        rx_verbose_arg = " --verbose" if full_stats else ""
+        sh = (rxcmd + f" --sink fd --out-fd 3 3>&1 1>/dev/null {UHD} | "
+              f"'{pybin()}' '{find_helper('rawdata_rx.py')}' --stdin "
+              f"--pid 0x100 --plen 200 --rate 600000 --modcod '{mc}' --symrate {int(sr)} "
+              f"--freq {int(float(s['freq_hz']))} --mode 'DVBS2_TR link'{pt_arg}{udp_out_arg}{rx_verbose_arg}")
+        _wait([_popen(["bash","-c",sh], env=env)]); return
+    pl = cfg.get("payload",{}); sink = pl.get("sink","file:/tmp/dvbs2_rx.ts")
+    if sink == "display": check_display_or_exit()
+    def consumer():                          # consumes the TS on stdin into the sink
+        if sink == "display":         return f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
+        if sink.startswith("udp://"):
+            u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"   # 7x188; player-friendly UDP TS
+            return f"| '{FFMPEG}' -hide_banner -loglevel error -fflags +nobuffer -probesize 32 -analyzeduration 0 -f mpegts -i - -c copy -flush_packets 1 -f mpegts '{u}' 2>/tmp/dvbs2_sink.log"
+        return f"> '{sink[5:] if sink.startswith('file:') else '/tmp/dvbs2_rx.ts'}'"
+    if full_stats:
+        # TS straight to the sink; the rich per-second line comes from the monitor poll.
+        if sink.startswith("file:"):
+            tail = f"--sink fd --out-fd 3 3>'{sink[5:]}' 1>/dev/null {UHD}"
+        else:
+            tail = f"--sink fd --out-fd 3 3>&1 1>/dev/null {UHD} " + consumer()
+        print(f"RX video -> {sink} (FULL STATS): {mc} {fr} @ {sr/1e6:.3f} MSym/s")
+        spawn = lambda: _popen(["bash","-c", rxcmd + " " + tail], env=env)
+        if auto:                              # ACM: relaunch on a live-MODCOD-change fault
+            _supervise_rx(mc, spawn, lambda p: poll_full_stats(MONPORT, cfg, p))
+        else:
+            poll_full_stats(MONPORT, cfg, spawn())
+        return
+    # default: TS through ts_tee_stats (recovered bitrate/continuity/lock + elapsed)
+    tee = (f"| '{pybin()}' '{find_helper('ts_tee_stats.py')}' --pid auto "
+           f"--modcod '{mc}' --frame '{fr}' --symrate {int(sr)}")
+    sh = rxcmd + f" --sink fd --out-fd 3 3>&1 1>/dev/null {UHD} " + tee + " " + consumer()
+    print(f"RX video -> {sink}: {mc} {fr} @ {sr/1e6:.3f} MSym/s  (live stats below)")
+    spawn = lambda: _popen(["bash","-c",sh], env=env)
+    if auto: _supervise_rx(mc, spawn)         # ACM: relaunch on a live-MODCOD-change fault
+    else: _wait([spawn()])
+
+def cmd_bench(cfg, secs, raw_udp_in=0, raw_udp_out=""):
+    """Local two-B210 link self-test: TX -> air -> RX, with readout."""
+    if engine_for(cfg["tx"]["modcod"]) == "extended":   # APSK -> extended engine full link
+        return extended_engine_run(cfg, "bench", secs)
+    spawn_tx_raw(cfg, raw_udp_in=raw_udp_in)    # registered in _PROCS, cleaned on exit
+    print(f"  warming up TX for 5 s ...")
+    time.sleep(5)
+    s = cfg["rx"]; mc = modcod_for_app(s["modcod"]); fr = s.get("frame_size","normal")
+    sr = float(s["symbol_rate"]); sps = int(s.get("oversample",4))
+    loff = float(s.get("lo_offset_hz", 2e6))
+    rxargs = [app("dvbs2-rx"),"-m",mc,"-p","on" if s.get("pilots",True) else "off",
+              "-s",str(int(sr)),"--sps",str(sps),"--frame-size",fr,
+              "--source","usrp","--usrp-args",usrp_args(cfg,"rx"),
+              "--usrp-antenna",s.get("antenna","RX2"),"--usrp-gain",str(s.get("gain_db",40)),
+              "--usrp-lo-offset",str(int(loff)),"-f",str(int(float(s["freq_hz"]))),
+              "--usrp-otw-format", samp_type_of(cfg),
+              "--usrp-stream-args", low_lat_stream_args()]
+    rxcmd = gr_shell_prefix() + "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
+    import shlex
+    pt = raw_payload_text(cfg)
+    pt_arg = f" --payload-text {shlex.quote(pt)}" if pt else ""
+    udp_out_arg = f" --udp-out {shlex.quote(raw_udp_out)}" if raw_udp_out else ""
+    sh = (f"timeout {int(secs)} bash -c \"" + rxcmd +
+          f" --sink fd --out-fd 3 3>&1 1>/dev/null 2>{rp('dvbs2_rx.radio.log')} | "
+          f"'{pybin()}' '{find_helper('rawdata_rx.py')}' --stdin --pid 0x100 --plen 200 "
+          f"--rate 600000 --modcod '{mc}' --symrate {int(sr)} --freq {int(float(s['freq_hz']))} "
+          f"--mode 'DVBS2_TR self-test'{pt_arg}{udp_out_arg}\"")
+    subprocess.run(["bash","-c",sh], env=media_env())
+    _kill_all()
+
+def cmd_duplex(cfg, raw, full_stats, secs, encoder=None, loopback=False,
+               raw_udp_in=0, raw_udp_out=""):
+    """FULL DUPLEX on ONE B210: transmit @[tx].freq_hz AND receive @[rx].freq_hz
+    simultaneously, in one combined modulate+demodulate flowgraph (fullduplex
+    helper). Each deployed node runs one of these; on the bench run it on each
+    B210 with the freq plan swapped for a bidirectional link.
+
+    --loopback: tell gr_fullduplex.py to skip the USRP and self-loop the TX
+    samples into the RX path inside the flowgraph."""
+    t = cfg["tx"]; r = cfg.get("rx", {})
+    if is_auto(t["modcod"]): sys.exit("duplex TX needs a concrete MODCOD ('auto' is RX-only).")
+    mc = modcod_for_app(t["modcod"]); fr = t.get("frame_size","normal"); sr = float(t["symbol_rate"])
+    sps = int(t.get("oversample",2)); pil = "on" if t.get("pilots",True) else "off"
+    txf = int(float(t["freq_hz"])); rxf = int(float(r.get("freq_hz", t["freq_hz"])))
+    da = usrp_args(cfg,"tx"); m = re.search(r"serial=([0-9A-Za-z]+)", da)
+    serial = m.group(1) if m else ""
+    if serial in ("", "0", "any"):
+        # No explicit serial in link.toml — query UHD for the first attached B210
+        # so the duplex helper doesn't get serial=0 (which never matches).
+        try:
+            probe = subprocess.run(
+                [pybin(),"-c","import uhd,sys; ds=uhd.find('type=b200'); "
+                 "print(ds[0]['serial']) if ds else sys.exit(2)"],
+                env=gr_env(), capture_output=True, text=True, timeout=8)
+            if probe.returncode == 0 and probe.stdout.strip():
+                serial = probe.stdout.strip()
+        except Exception:
+            pass
+    fd = find_helper("gr_fullduplex.py")
+    import shlex as _sx
+    fdargs = (f"--serial {serial or 'any'} --tx-freq {txf} --rx-offset-hz {rxf-txf} --sym-rate {int(sr)} "
+              f"--modcod {mc} --frame-size {fr} --sps {sps} --tx-gain {t.get('gain_db',89)} "
+              f"--rx-gain {r.get('gain_db',40)} --tx-antenna {t.get('antenna','TX/RX')} "
+              f"--rx-antenna {r.get('antenna','RX2')} --pilots {pil} --rolloff {t.get('rolloff',0.35)} "
+              f"--otw-format {samp_type_of(cfg)} "
+              f"--stream-args {_sx.quote(low_lat_stream_args())} "
+              f"--in-fd 0 --out-fd 3")
+    if full_stats: fdargs += f" --mon-server --mon-port {MONPORT}"
+    if loopback:   fdargs += " --loopback"
+    fdcmd = gr_shell_prefix() + f"'{pybin()}' '{fd}' " + fdargs
+    UHD = f"2>>{rp('dvbs2_dx.radio.log')}" if loopback else f"2>{rp('dvbs2_dx.radio.log')}"
+    if loopback:
+        print(f"DUPLEX (loopback, no radio): TX {mc} {fr} @ {txf/1e6:.1f} MHz nominal  +  RX self-loop "
+              f"(USRP skipped)")
+    else:
+        print(f"DUPLEX on B210 {serial}: TX {mc} {fr} @ {txf/1e6:.1f} MHz  +  RX @ {rxf/1e6:.1f} MHz "
+              f"(one radio, simultaneous)")
+    if raw:
+        import shlex
+        pt = raw_payload_text(cfg)
+        pt_arg = f" --payload-text {shlex.quote(pt)}" if pt else ""
+        udp_in_arg = f" --udp-in {raw_udp_in}" if raw_udp_in else ""
+        udp_out_arg = f" --udp-out {shlex.quote(raw_udp_out)}" if raw_udp_out else ""
+        rx_verbose_arg = " --verbose" if full_stats else ""
+        mode_label = "LOOPBACK" if loopback else f"FULL-DUPLEX {serial}"
+        sh = (f"'{pybin()}' '{find_helper('rawdata_gen.py')}' --plen 200 --datarate 600000 "
+              f"--netrate {int(sr)} --pid 0x100{pt_arg}{udp_in_arg} 2>/dev/null | " + fdcmd +
+              f" 3>&1 1>/dev/null {UHD} | '{pybin()}' '{find_helper('rawdata_rx.py')}' --stdin "
+              f"--pid 0x100 --plen 200 --rate 600000 --modcod '{mc}' --symrate {int(sr)} "
+              f"--mode '{mode_label}'{pt_arg}{udp_out_arg}{rx_verbose_arg}")
+        _wait([_popen(["bash","-c",sh], env=media_env())]); return
+    # video: file sources are pre-encoded to a CBR cache and looped; live
+    # sources (v4l2/udp/pipe) are encoded on the fly so the webcam / network
+    # feed reaches the modulator without going through a stale cache. Mirror
+    # of cmd_tx's branch at the same name.
+    net = net_ts_bps(t["modcod"], fr, sr, t.get("pilots",True)); vb = net*0.82
+    pl = cfg.get("payload",{}); src = pl.get("source","file:"+os.path.join(HERE, "media", "sample.mp4"))
+    res = pl.get("resolution","auto"); res = auto_resolution(vb) if res=="auto" else res
+    fps = int(pl.get("framerate",25))
+    if src.startswith("file:"):
+        cache = preencode_file(src[5:], res, vb, net, fps)
+        prod = f"while :; do cat '{cache}'; done"
+    else:
+        import shlex as _sx
+        enc = (encoder or pl.get("encoder", "hw")).lower()
+        print(f"DUPLEX TX (live, encoder={enc}): {src} -> {res}@{vb/1e6:.2f}Mbps")
+        ff = build_encode(src, res, vb, net, fps, enc)
+        prod = " ".join(_sx.quote(x) for x in ff) + " 2>/tmp/dvbs2_tx.enc.log"
+    sink = pl.get("sink","file:/tmp/dvbs2_rx.ts")
+    if sink == "display": check_display_or_exit()
+    if sink == "display":          cons = f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
+    elif sink.startswith("udp://"):
+        u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"
+        cons = f"| '{FFMPEG}' -hide_banner -loglevel error -fflags +nobuffer -probesize 32 -analyzeduration 0 -f mpegts -i - -c copy -flush_packets 1 -f mpegts '{u}' 2>/tmp/dvbs2_sink.log"
+    elif sink.startswith("file:"): cons = f"> '{sink[5:]}'"
+    else:                          cons = "> /tmp/dvbs2_rx.ts"
+    tee = (f"| '{pybin()}' '{find_helper('ts_tee_stats.py')}' --pid auto "
+           f"--modcod '{mc}' --frame '{fr}' --symrate {int(sr)}")
+    sh = (prod + " | " + fdcmd +
+          f" 3>&1 1>/dev/null {UHD} " + tee + " " + cons)
+    if full_stats:
+        if loopback:
+            with open(rp("dvbs2_dx.radio.log"), "w") as _f:
+                _f.write("Actually got clock rate 0 (loopback)\n")
+        proc = _popen(["bash","-c", sh], env=media_env())
+        # DUPLEX --full-stats: TX-ticker thread + RX poll, routed through one
+        # _StatsWriter so a wide terminal renders them as two columns. The
+        # writer's t0 is the shared clock for elapsed-second alignment.
+        writer = _StatsWriter()
+        print(f"  duplex stats — {'two-column' if writer.two_col else 'interleaved (terminal <160 cols)'}; "
+              f"\033[1;36m[TX MM:SS]\033[0m on the modulator, \033[1;34m[RX MM:SS]\033[0m on the demod",
+              flush=True)
+        _stop_tx = threading.Event()
+        def _tx_ticker():
+            t_mc = mc; t_fr = fr; t_pil = "pilots" if t.get("pilots",True) else "no-pilots"
+            t_sr = sr
+            t_fps = frame_rate(t_mc, t_fr, t_sr, bool(t.get("pilots",True)))
+            t_net = net_ts_bps(t_mc, t_fr, t_sr, bool(t.get("pilots",True)))
+            while not _stop_tx.is_set() and proc.poll() is None:
+                _stop_tx.wait(1.0)
+                if _stop_tx.is_set(): break
+                e = int(time.time() - writer.t0)
+                writer.tx(e,
+                    f"{t_mc} {t_fr} {t_pil} @ {t_sr/1e6:.3f} MSym/s | duplex | "
+                    f"{t_fps:.0f} PLFRAME/s, {int(e*t_fps)} sent | link {t_net/1e6:.2f} Mbps")
+        tx_thr = threading.Thread(target=_tx_ticker, daemon=True); tx_thr.start()
+        try:
+            poll_full_stats(MONPORT, cfg, proc, writer=writer, loopback=loopback, skip_radio_wait=True)
+        finally:
+            _stop_tx.set()
+            writer.close()
+        return
+    _wait([_popen(["bash","-c",sh], env=media_env())])
+
+def _wait(procs):
+    try:
+        while all(p.poll() is None for p in procs): time.sleep(0.3)
+    except KeyboardInterrupt:
+        pass
+    _kill_all()
+
+def _supervise_rx(label, spawn, monitor=None):
+    """Keep a long-running receiver alive across faults. In MODCOD auto-detect the demod
+    can fault when the live MODCOD changes mid-stream (FEC reconfiguration); relaunch so
+    the link re-acquires the NEW MODCOD after a brief gap. Ctrl-C / SIGTERM stops cleanly
+    (no relaunch). Neutral, backend-agnostic messages only."""
+    restarts = 0
+    while True:
+        p = spawn()
+        try:
+            if monitor: monitor(p)                       # blocks until p exits
+            else:
+                while p.poll() is None: time.sleep(0.3)
+        except KeyboardInterrupt:
+            _killgrp(p, signal.SIGINT)
+            try: p.wait(timeout=3)
+            except BaseException: _killgrp(p, signal.SIGKILL)
+            return
+        rc = p.poll()                                    # real exit code before we clean up
+        _killgrp(p, signal.SIGKILL)                      # ensure pipeline stragglers are down
+        try: _PROCS.remove(p)
+        except ValueError: pass
+        if rc == 0: return                               # clean end (not expected for radio src)
+        restarts += 1
+        if restarts > 60:
+            print("  [link] receiver could not be sustained; stopping."); return
+        print(f"  [link] re-acquiring ({label}) after a MODCOD change/fault — restart {restarts}")
+        time.sleep(5)                                    # let the radio front-end settle
+
+def main():
+    try: sys.stdout.reconfigure(line_buffering=True)   # live progress when piped/redirected
+    except Exception: pass
+    EPILOG = """\
+Valid MODCODs (case-insensitive; '/' or '_' separator are equivalent):
+  QPSK   : 1/2  3/5  2/3  3/4  4/5  5/6  8/9  9/10
+  8PSK   : 3/5  2/3  3/4  5/6  8/9  9/10
+  16APSK : 2/3  3/4  4/5  5/6  8/9  9/10            (extended path; high latency)
+  32APSK : 3/4  4/5  5/6  8/9  9/10                 (extended path; high latency)
+  RX     : may also use 'auto' for ACM/VCM detection from the PL header.
+
+Symbol rate (-s / --symrate) typical range: 500e3 .. 4e6 (B210 USB caps the upper end).
+Frame size  (--frame)        : 'short' (16200) for sub-second latency, 'normal' (64800) for coding gain.
+Pilots      (--pilots)       : 'on' (default; tighter carrier tracking) or 'off'.
+
+Run `./dvbs2_TR rates` to print the net bitrate and resolution for the current link.toml.
+"""
+    ap = argparse.ArgumentParser(
+        prog="dvbs2_TR",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=EPILOG)
+    ap.add_argument("mode", choices=["check","tx","rx","bench","duplex","rates"])
+    ap.add_argument("--config", default=default_config())
+    ap.add_argument("--raw", action="store_true", help="raw-data mode for tx/rx (link self-test)")
+    ap.add_argument("--full-stats", dest="full_stats", action="store_true",
+                    help="rx/duplex: rich per-second readout (SNR(Es/N0), CFO, LDPC iters, FER)")
+    ap.add_argument("--loopback", dest="loopback", action="store_true", default=None,
+                    help="internal loopback (no radio). Valid for 'duplex' and 'check'. "
+                         "Rejected for 'tx', 'rx', 'bench' (half-link modes). "
+                         "Overrides [link].loopback in link.toml.")
+    ap.add_argument("--raw-udp-in", dest="raw_udp_in", type=int, default=0,
+                    help="raw mode (tx/bench/duplex): TX listens on this UDP port and "
+                         "injects each datagram as one raw frame payload.")
+    ap.add_argument("--raw-udp-out", dest="raw_udp_out", default="",
+                    help="raw mode (rx/bench/duplex): RX forwards each recovered payload "
+                         "as a UDP datagram to host:port.")
+    ap.add_argument("--encoder", choices=["hw","sw"], default=None,
+                    help="live video encoder backend for tx/duplex: 'hw' = "
+                         "nvv4l2h264enc (Jetson NVENC, default), 'sw' = libx264 "
+                         "via ffmpeg. Overrides [payload].encoder in link.toml.")
+    ap.add_argument("--secs", type=int, default=20, help="bench duration (s)")
+    ap.add_argument("-m", "--modcod", help="override MODCOD (e.g. QPSK3/4, 8PSK2/3, 16APSK2/3; "
+                    "or 'auto' on RX = ACM/VCM auto-detect from the PL header). See epilog for the full list.")
+    ap.add_argument("-s", "--symrate", type=float,
+                    help="override symbol rate (Hz, e.g. 2e6). Typical 500e3 .. 4e6.")
+    ap.add_argument("--frame", choices=["short", "normal"], help="override FECFRAME size")
+    ap.add_argument("--pilots", choices=["on","off"],
+                    help="override PL pilots on/off (default: from link.toml)")
+    ap.add_argument("--serial", type=str,
+                    help="override B210 serial (e.g. --serial 8000691). "
+                         "If unset, the first attached B210 is auto-picked.")
+    ap.add_argument("--tx-freq", dest="tx_freq", type=float, help="override TX center freq (Hz)")
+    ap.add_argument("--rx-freq", dest="rx_freq", type=float, help="override RX center freq (Hz)")
+    a = ap.parse_args()
+    cfg = load_toml(a.config)
+    if a.loopback is None:
+        a.loopback = bool((cfg.get("link") or {}).get("loopback", False))
+    def _ov(sec):                                    # CLI overrides the config file
+        if sec not in cfg: return
+        if a.modcod:  cfg[sec]["modcod"] = a.modcod
+        if a.symrate: cfg[sec]["symbol_rate"] = a.symrate
+        if a.frame:   cfg[sec]["frame_size"] = a.frame
+        if a.pilots:  cfg[sec]["pilots"] = (a.pilots == "on")
+    if   a.mode == "tx": _ov("tx")
+    elif a.mode == "rx": _ov("rx")
+    else:                _ov("tx"); _ov("rx")
+    if a.tx_freq: cfg.setdefault("tx", {})["freq_hz"] = a.tx_freq
+    if a.rx_freq: cfg.setdefault("rx", {})["freq_hz"] = a.rx_freq
+    # --serial overrides [tx].device_args, [rx].device_args, and [node].device_args
+    # so the chosen B210 is used end-to-end. When --serial is omitted and link.toml
+    # has no explicit serial either, the driver picks the first attached B210
+    # (cmd_duplex queries UHD; dvbs2-tx/-rx fall back to type=b200).
+    if a.serial:
+        _devarg = f"type=b200,serial={a.serial}"
+        for _sec in ("tx", "rx", "node"):
+            cfg.setdefault(_sec, {})["device_args"] = _devarg
+    if a.mode in ("tx", "bench", "duplex") and is_auto(cfg.get("tx", {}).get("modcod", "")):
+        sys.exit("error: TX needs a concrete MODCOD (e.g. -m QPSK1/2); 'auto' is RX-only (ACM detect).")
+    if a.loopback and a.mode in ("tx", "rx", "bench"):
+        sys.exit("error: --loopback is end-to-end (TX+RX in one flowgraph); '%s' is a "
+                 "half-link mode. Use 'duplex --loopback' instead." % a.mode)
+    if   a.mode == "check":  sys.exit(cmd_check(cfg, a.loopback))
+    elif a.mode == "rates":  cmd_rates(cfg)
+    elif a.mode == "bench":  cmd_bench(cfg, a.secs, raw_udp_in=a.raw_udp_in, raw_udp_out=a.raw_udp_out)
+    elif a.mode == "tx":     cmd_tx(cfg, a.raw, a.encoder, raw_udp_in=a.raw_udp_in)
+    elif a.mode == "rx":     cmd_rx(cfg, a.raw, a.full_stats, raw_udp_out=a.raw_udp_out)
+    elif a.mode == "duplex": cmd_duplex(cfg, a.raw, a.full_stats, a.secs, a.encoder,
+                                       loopback=a.loopback,
+                                       raw_udp_in=a.raw_udp_in, raw_udp_out=a.raw_udp_out)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except SystemExit:
+        raise                       # intentional, already-neutral exit messages
+    except Exception as e:          # never leak a traceback (it can name the backend)
+        sys.exit(f"DVBS2_TR error: {type(e).__name__}. Run 'DVBS2_TR check' and verify link.toml.")
