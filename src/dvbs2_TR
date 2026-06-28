@@ -1023,8 +1023,9 @@ def cmd_rx(cfg, raw, full_stats=False, raw_udp_out=""):
         _wait([_popen(["bash","-c",sh], env=env)]); return
     pl = cfg.get("payload",{}); sink = pl.get("sink","file:/tmp/dvbs2_rx.ts")
     if sink == "display": check_display_or_exit()
+    net_bps = net_ts_bps(s["modcod"], fr, sr, bool(s.get("pilots", True)))
     def consumer():                          # consumes the TS on stdin into the sink
-        if sink == "display":         return f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
+        if sink == "display":         return f"| '{pybin()}' '{find_helper('ts_smooth.py')}' --bitrate {int(net_bps)} | '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
         if sink.startswith("udp://"):
             u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"   # 7x188; player-friendly UDP TS
             return f"| '{FFMPEG}' -hide_banner -loglevel error -fflags +nobuffer -probesize 32 -analyzeduration 0 -f mpegts -i - -c copy -flush_packets 1 -f mpegts '{u}' 2>/tmp/dvbs2_sink.log"
@@ -1160,8 +1161,12 @@ def cmd_duplex(cfg, raw, full_stats, secs, encoder=None, loopback=False,
         ff = build_encode(src, res, vb, net, fps, enc)
         prod = " ".join(_sx.quote(x) for x in ff) + " 2>/tmp/dvbs2_tx.enc.log"
     sink = pl.get("sink","file:/tmp/dvbs2_rx.ts")
-    if sink == "display": check_display_or_exit()
-    if sink == "display":          cons = f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
+    if sink == "display":
+        check_display_or_exit()
+        net_bps = net_ts_bps(t["modcod"], fr, sr, bool(t.get("pilots", True)))
+        cons = (f"| '{pybin()}' '{find_helper('ts_smooth.py')}' --bitrate {int(net_bps)}"
+                f" | '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i -"
+                f" 2>/tmp/dvbs2_sink.log")
     elif sink.startswith("udp://"):
         u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"
         cons = f"| '{FFMPEG}' -hide_banner -loglevel error -fflags +nobuffer -probesize 32 -analyzeduration 0 -f mpegts -i - -c copy -flush_packets 1 -f mpegts '{u}' 2>/tmp/dvbs2_sink.log"
