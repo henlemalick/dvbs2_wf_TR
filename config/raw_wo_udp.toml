@@ -1,6 +1,7 @@
 # dvbs2_wf_TR - raw data mode without UDP
-# Synthetic data self-test (TX generates test frames, RX verifies)
+# TX/RX raw test frames over B210 (or --loopback for internal self-test)
 # Usage: dvbs2_wf_TR.sh bench raw_wo_udp
+#        dvbs2_wf_TR.sh duplex raw_wo_udp --loopback
 #        dvbs2_wf_TR.sh tx raw_wo_udp --raw
 #        dvbs2_wf_TR.sh rx raw_wo_udp --raw
 

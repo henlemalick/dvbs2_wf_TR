@@ -1,8 +1,10 @@
 # dvbs2_wf_TR - raw data mode with UDP
-# External data injection via UDP (TX reads UDP, RX forwards to UDP)
+# External data injection via UDP over B210 (TX reads UDP, RX forwards to UDP)
+# Use --loopback for internal self-test without radio.
 # Usage: dvbs2_wf_TR.sh tx raw_w_udp --raw --raw-udp-in 5005
 #        dvbs2_wf_TR.sh rx raw_w_udp --raw --raw-udp-out VIEWER_IP:5006
 #        dvbs2_wf_TR.sh bench raw_w_udp --raw --raw-udp-in 5005 --raw-udp-out VIEWER_IP:5006
+#        dvbs2_wf_TR.sh duplex raw_w_udp --loopback --raw-udp-in 5005 --raw-udp-out VIEWER_IP:5006
 
 [node]
 device_args = "type=b200"

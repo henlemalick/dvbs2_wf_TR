@@ -15,8 +15,10 @@
 #   video       (default)  live camera (v4l2) to remote UDP sink
 #   video_local            live camera to local display (ffplay)
 #   video_remote           file source to remote UDP sink
-#   raw_wo_udp             synthetic data loopback (no UDP)
-#   raw_w_udp              external data via UDP injection/extraction
+#   raw_wo_udp             raw data over B210, no UDP
+#   raw_w_udp              raw data over B210, UDP in/out
+#
+# Use --loopback for bench/duplex internal self-test (any profile).
 #
 # Examples:
 #   ./dvbs2_wf_TR.sh check
@@ -24,6 +26,7 @@
 #   ./dvbs2_wf_TR.sh rx video --full-stats
 #   ./dvbs2_wf_TR.sh duplex video
 #   ./dvbs2_wf_TR.sh bench raw_wo_udp --secs 30
+#   ./dvbs2_wf_TR.sh duplex raw_wo_udp --loopback
 #   ./dvbs2_wf_TR.sh tx raw_w_udp --raw-udp-in 5005
 # =============================================================================
 set -e
@@ -61,7 +64,7 @@ fi
 # ---- validations -----------------------------------------------------------
 if [ ! -f "$BINARY" ]; then
     echo "error: binary not found at $BINARY"
-    echo "Run 'scripts/build_driver_binary.sh' first, or deploy via 'deploy.sh'."
+    echo "Run 'scripts/build_driver_binary.sh' first."
     exit 1
 fi
 if [ ! -f "$_CONFIG_PATH" ]; then
@@ -69,17 +72,8 @@ if [ ! -f "$_CONFIG_PATH" ]; then
     exit 1
 fi
 
-# ---- auto-add --loopback for bench/duplex raw modes ------------------------
-_EXTRA_ARGS=()
-if [ "$_OP" = "bench" ] || [ "$_OP" = "duplex" ]; then
-    if [ "$_PROFILE" = "raw_wo_udp" ] || [ "$_PROFILE" = "raw_w_udp" ]; then
-        _EXTRA_ARGS+=(--loopback)
-    fi
-fi
-
 exec "$BINARY" \
     --config "$_CONFIG_PATH" \
     "${_RAW_FLAG[@]}" \
-    "${_EXTRA_ARGS[@]}" \
     "$_OP" \
     "$@"
