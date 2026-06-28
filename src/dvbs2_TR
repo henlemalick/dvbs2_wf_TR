@@ -1298,6 +1298,8 @@ Run `./dvbs2_TR rates` to print the net bitrate and resolution for the current l
                          "If unset, the first attached B210 is auto-picked.")
     ap.add_argument("--tx-freq", dest="tx_freq", type=float, help="override TX center freq (Hz)")
     ap.add_argument("--rx-freq", dest="rx_freq", type=float, help="override RX center freq (Hz)")
+    ap.add_argument("--tx-gain", dest="tx_gain", type=float, help="override TX gain (dB)")
+    ap.add_argument("--rx-gain", dest="rx_gain", type=float, help="override RX gain (dB)")
     a = ap.parse_args()
     cfg = load_toml(a.config)
     if a.loopback is None:
@@ -1313,6 +1315,8 @@ Run `./dvbs2_TR rates` to print the net bitrate and resolution for the current l
     else:                _ov("tx"); _ov("rx")
     if a.tx_freq: cfg.setdefault("tx", {})["freq_hz"] = a.tx_freq
     if a.rx_freq: cfg.setdefault("rx", {})["freq_hz"] = a.rx_freq
+    if a.tx_gain is not None: cfg.setdefault("tx", {})["gain_db"] = a.tx_gain
+    if a.rx_gain is not None: cfg.setdefault("rx", {})["gain_db"] = a.rx_gain
     # --serial overrides [tx].device_args, [rx].device_args, and [node].device_args
     # so the chosen B210 is used end-to-end. When --serial is omitted and link.toml
     # has no explicit serial either, the driver picks the first attached B210
