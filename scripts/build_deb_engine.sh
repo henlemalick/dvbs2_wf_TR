@@ -69,6 +69,7 @@ find "$BUILD" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 find "$BUILD" -type d -exec chmod 755 {} \;
 find "$BUILD" -type f -exec chmod 644 {} \;
 find "$BUILD" -type f \( -name '*.so' -o -name '*.so.*' \) -exec chmod 755 {} \;
+find "$BUILD" -type f -path '*/bin/*' ! -name '*.py' -exec chmod 755 {} \;  # scripts + ELF in bin/
 
 # ---- build -----------------------------------------------------------------
 echo "  Building $DEB (may take a few minutes for ~1.3 GB) ..."

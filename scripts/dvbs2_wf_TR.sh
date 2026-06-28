@@ -31,24 +31,23 @@
 # =============================================================================
 set -e
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 BINARY="$HERE/bin/dvbs2_wf_TR"
 CONFIG_DIR="$HERE/config"
 
 # ---- parse operation and optional profile ----------------------------------
 _OP="$1"
-_PROFILE="${2:-video}"
+_PROFILE="${2:-video_local}"
 _RAW_FLAG=()
 
 case "$_PROFILE" in
-    video)       _CONFIG="video.toml" ;;
     video_local) _CONFIG="video_local.toml" ;;
     video_remote)_CONFIG="video_remote.toml" ;;
     raw_wo_udp)  _CONFIG="raw_wo_udp.toml";  _RAW_FLAG=(--raw) ;;
     raw_w_udp)   _CONFIG="raw_w_udp.toml";   _RAW_FLAG=(--raw) ;;
     *)
         echo "error: unknown profile '$_PROFILE'"
-        echo "valid profiles: video, video_local, video_remote, raw_wo_udp, raw_w_udp"
+        echo "valid profiles: video_local, video_remote, raw_wo_udp, raw_w_udp"
         exit 1
         ;;
 esac
