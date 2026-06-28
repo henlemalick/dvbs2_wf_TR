@@ -1024,7 +1024,7 @@ def cmd_rx(cfg, raw, full_stats=False, raw_udp_out=""):
     pl = cfg.get("payload",{}); sink = pl.get("sink","file:/tmp/dvbs2_rx.ts")
     if sink == "display": check_display_or_exit()
     def consumer():                          # consumes the TS on stdin into the sink
-        if sink == "display":         return f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
+        if sink == "display":         return f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -buffer_size 256000 -probesize 100000 -analyzeduration 100000 -i - 2>/tmp/dvbs2_sink.log"
         if sink.startswith("udp://"):
             u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"   # 7x188; player-friendly UDP TS
             return f"| '{FFMPEG}' -hide_banner -loglevel error -fflags +nobuffer -probesize 32 -analyzeduration 0 -f mpegts -i - -c copy -flush_packets 1 -f mpegts '{u}' 2>/tmp/dvbs2_sink.log"
@@ -1161,7 +1161,7 @@ def cmd_duplex(cfg, raw, full_stats, secs, encoder=None, loopback=False,
         prod = " ".join(_sx.quote(x) for x in ff) + " 2>/tmp/dvbs2_tx.enc.log"
     sink = pl.get("sink","file:/tmp/dvbs2_rx.ts")
     if sink == "display": check_display_or_exit()
-    if sink == "display":          cons = f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -i - 2>/tmp/dvbs2_sink.log"
+    if sink == "display":          cons = f"| '{FFPLAY}' -loglevel error -fflags nobuffer -flags low_delay -buffer_size 256000 -probesize 100000 -analyzeduration 100000 -i - 2>/tmp/dvbs2_sink.log"
     elif sink.startswith("udp://"):
         u = sink + ("&" if "?" in sink else "?") + "pkt_size=1316"
         cons = f"| '{FFMPEG}' -hide_banner -loglevel error -fflags +nobuffer -probesize 32 -analyzeduration 0 -f mpegts -i - -c copy -flush_packets 1 -f mpegts '{u}' 2>/tmp/dvbs2_sink.log"
