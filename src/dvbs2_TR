@@ -1029,10 +1029,10 @@ def cmd_rx(cfg, raw, full_stats=False, raw_udp_out=""):
               "--ldpc-iterations", str(cfg.get("fec",{}).get("ldpc_iters",25))]
     if serial: rxargs += ["--serial", serial]
     if pilots != "off": rxargs += ["--pilots", pilots]
-    if auto: rxargs += ["--pl-acm-vcm"]               # accept all MODCODs; detect from PL header
+    if auto: rxargs += ["--pl-acm-vcm"]
     if full_stats: rxargs += ["--mon-server","--mon-port",str(MONPORT)]
     env = media_env()
-    rxcmd = "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
+    rxcmd = gr_shell_prefix() + " ".join(f"'{a}'" for a in rxargs)
     UHD = f"2>{rp('dvbs2_rx.radio.log')}"
     if raw:
         print(f"RX raw-data readout: {mc} {fr} @ {sr/1e6:.3f} MSym/s"
@@ -1101,7 +1101,7 @@ def cmd_bench(cfg, secs, raw_udp_in=0, raw_udp_out=""):
     if serial: rxargs += ["--serial", serial]
     if s.get("pilots",True): rxargs += ["--pilots", "on"]
     else: rxargs += ["--pilots", "off"]
-    rxcmd = "'"+pybin()+"' " + " ".join(f"'{a}'" for a in rxargs)
+    rxcmd = gr_shell_prefix() + " ".join(f"'{a}'" for a in rxargs)
     import shlex
     pt = raw_payload_text(cfg)
     pt_arg = f" --payload-text {shlex.quote(pt)}" if pt else ""
