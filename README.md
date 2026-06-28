@@ -37,6 +37,36 @@ One binary, one folder, zero Python at runtime.
 
 ## Deploy to Another Jetson
 
+### Option A — Debian packages (recommended)
+
+Download the latest `.deb` files from the
+[GitHub Releases](https://github.com/henlemalick/dvbs2_wf_TR/releases) page,
+then install on the target Jetson:
+
+```bash
+# Install engine first (large, ~256 MB compressed)
+sudo dpkg -i dvbs2-wf-tr-engine_*.deb
+
+# Install driver (binary + configs + media)
+sudo dpkg -i dvbs2-wf-tr_*.deb
+
+# Run
+dvbs2_wf_TR check
+dvbs2_wf_TR tx video
+```
+
+To rebuild the `.deb` packages from source:
+
+```bash
+# On the reference Jetson (requires /usr/local/lib/.engine/):
+sudo bash scripts/build_deb_engine.sh
+
+# On any machine with the repo:
+bash scripts/build_deb_driver.sh
+```
+
+### Option B — Scripted deploy (legacy)
+
 ```bash
 ./scripts/deploy.sh TARGET_IP [ssh_user]
 ```
